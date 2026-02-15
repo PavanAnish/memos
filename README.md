@@ -60,6 +60,14 @@ docker run -d \
   -v ~/.memos:/var/opt/memos \
   neosmemo/memos:stable
 ```
+### powershell
+```powershell
+docker run -d `
+  --name memos `
+  -p 5230:5230 `
+  -v ${env:USERPROFILE}\memos:/var/opt/memos `
+  neosmemo/memos:stable
+```
 
 Open `http://localhost:5230` and start writing!
 
