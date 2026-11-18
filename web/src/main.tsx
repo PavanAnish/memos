@@ -3,22 +3,21 @@ import { QueryClientProvider } from "@tanstack/react-query";
 import { ReactQueryDevtools } from "@tanstack/react-query-devtools";
 import React, { useEffect, useRef } from "react";
 import { createRoot } from "react-dom/client";
-import { Toaster } from "react-hot-toast";
 import { RouterProvider } from "react-router-dom";
 import "./i18n";
 import "./index.css";
+import { Toast, Tooltip } from "@usememos/ui";
 import { ErrorBoundary } from "@/components/ErrorBoundary";
 import { refreshAccessToken } from "@/connect";
 import { AuthProvider, useAuth } from "@/contexts/AuthContext";
 import { InstanceProvider, useInstance } from "@/contexts/InstanceContext";
-import { ViewProvider } from "@/contexts/ViewContext";
+import { useLiveMemoRefresh } from "@/hooks/useLiveMemoRefresh";
 import { useTokenRefreshOnFocus } from "@/hooks/useTokenRefreshOnFocus";
 import { queryClient } from "@/lib/query-client";
+import { toast } from "@/lib/toast";
 import router from "./router";
-import { applyLocaleEarly } from "./utils/i18n";
+import { applyLocaleEarly, useTranslate } from "./utils/i18n";
 import { applyThemeEarly } from "./utils/theme";
-import "leaflet/dist/leaflet.css";
-import "katex/dist/katex.min.css";
 
 // Apply theme and locale early to prevent flash
 applyThemeEarly();
@@ -26,8 +25,8 @@ applyLocaleEarly();
 
 // Inner component that initializes contexts
 function AppInitializer({ children }: { children: React.ReactNode }) {
-  const { isInitialized: authInitialized, initialize: initAuth, currentUser } = useAuth();
-  const { isInitialized: instanceInitialized, initialize: initInstance } = useInstance();
+  const { isIdentityInitialized, initialize: initAuth, currentUser } = useAuth();
+  const { isProfileInitialized, initialize: initInstance } = useInstance();
   const initStartedRef = useRef(false);
 
   // Initialize on mount - run in parallel for better performance
@@ -46,11 +45,23 @@ function AppInitializer({ children }: { children: React.ReactNode }) {
   // Related: https://github.com/usememos/memos/issues/5589
   useTokenRefreshOnFocus(refreshAccessToken, !!currentUser);
 
-  if (!authInitialized || !instanceInitialized) {
+  // Live refresh: listen for memo changes via SSE and invalidate caches.
+  useLiveMemoRefresh();
+
+  // Route loading and feed requests only need the verified identity and the
+  // instance profile. Display-sensitive settings continue in the background;
+  // PagedMemoList keeps memo content hidden until privacy settings have settled.
+  if (!isIdentityInitialized || !isProfileInitialized) {
     return null;
   }
 
   return <>{children}</>;
+}
+
+/** The one place toasts render, with their close buttons named in the user's language. */
+function ToastViewport() {
+  const t = useTranslate();
+  return <Toast.Viewport closeLabel={t("common.close")} />;
 }
 
 function Main() {
@@ -59,12 +70,14 @@ function Main() {
       <QueryClientProvider client={queryClient}>
         <InstanceProvider>
           <AuthProvider>
-            <ViewProvider>
+            <Tooltip.Provider>
               <AppInitializer>
-                <RouterProvider router={router} />
-                <Toaster position="top-right" />
+                <Toast.Provider toastManager={toast}>
+                  <RouterProvider router={router} />
+                  <ToastViewport />
+                </Toast.Provider>
               </AppInitializer>
-            </ViewProvider>
+            </Tooltip.Provider>
           </AuthProvider>
         </InstanceProvider>
         <ReactQueryDevtools initialIsOpen={false} />

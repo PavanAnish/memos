@@ -5,6 +5,7 @@ import (
 
 	"github.com/pkg/errors"
 	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/proto"
 
 	storepb "github.com/usememos/memos/proto/gen/store"
 )
@@ -23,7 +24,9 @@ type DeleteInstanceSetting struct {
 	Name string
 }
 
-func (s *Store) UpsertInstanceSetting(ctx context.Context, upsert *storepb.InstanceSetting) (*storepb.InstanceSetting, error) {
+// encodeInstanceSetting turns a setting into its stored row, normalizing a
+// storage setting and validating usage limits as every write must.
+func encodeInstanceSetting(upsert *storepb.InstanceSetting) (*InstanceSetting, error) {
 	instanceSettingRaw := &InstanceSetting{
 		Name: upsert.Key.String(),
 	}
@@ -34,17 +37,36 @@ func (s *Store) UpsertInstanceSetting(ctx context.Context, upsert *storepb.Insta
 	} else if upsert.Key == storepb.InstanceSettingKey_GENERAL {
 		valueBytes, err = protojson.Marshal(upsert.GetGeneralSetting())
 	} else if upsert.Key == storepb.InstanceSettingKey_STORAGE {
+		NormalizeInstanceStorageSetting(upsert.GetStorageSetting())
 		valueBytes, err = protojson.Marshal(upsert.GetStorageSetting())
-	} else if upsert.Key == storepb.InstanceSettingKey_MEMO_RELATED {
-		valueBytes, err = protojson.Marshal(upsert.GetMemoRelatedSetting())
+	} else if upsert.Key == storepb.InstanceSettingKey_TAGS {
+		valueBytes, err = protojson.Marshal(upsert.GetTagsSetting())
+	} else if upsert.Key == storepb.InstanceSettingKey_NOTIFICATION {
+		valueBytes, err = protojson.Marshal(upsert.GetNotificationSetting())
+	} else if upsert.Key == storepb.InstanceSettingKey_AI {
+		valueBytes, err = protojson.Marshal(upsert.GetAiSetting())
+	} else if upsert.Key == storepb.InstanceSettingKey_ACCESS {
+		valueBytes, err = protojson.Marshal(upsert.GetAccessSetting())
+	} else if upsert.Key == storepb.InstanceSettingKey_USAGE_LIMITS {
+		if err := ValidateInstanceUsageLimitsSetting(upsert.GetUsageLimitsSetting()); err != nil {
+			return nil, err
+		}
+		valueBytes, err = protojson.Marshal(upsert.GetUsageLimitsSetting())
 	} else {
 		return nil, errors.Errorf("unsupported instance setting key: %v", upsert.Key)
 	}
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to marshal instance setting value")
 	}
-	valueString := string(valueBytes)
-	instanceSettingRaw.Value = valueString
+	instanceSettingRaw.Value = string(valueBytes)
+	return instanceSettingRaw, nil
+}
+
+func (s *Store) UpsertInstanceSetting(ctx context.Context, upsert *storepb.InstanceSetting) (*storepb.InstanceSetting, error) {
+	instanceSettingRaw, err := encodeInstanceSetting(upsert)
+	if err != nil {
+		return nil, err
+	}
 	instanceSettingRaw, err = s.driver.UpsertInstanceSetting(ctx, instanceSettingRaw)
 	if err != nil {
 		return nil, errors.Wrap(err, "Failed to upsert instance setting")
@@ -53,8 +75,25 @@ func (s *Store) UpsertInstanceSetting(ctx context.Context, upsert *storepb.Insta
 	if err != nil {
 		return nil, errors.Wrap(err, "Failed to convert instance setting")
 	}
-	s.instanceSettingCache.Set(ctx, instanceSetting.Key.String(), instanceSetting)
+	s.cacheInstanceSetting(ctx, instanceSetting)
+	if upsert.Key == storepb.InstanceSettingKey_STORAGE {
+		s.resetStorageDriverCache()
+	}
 	return instanceSetting, nil
+}
+
+// DeleteInstanceSetting deletes a database-backed instance setting and clears
+// cached state derived from it.
+func (s *Store) DeleteInstanceSetting(ctx context.Context, delete *DeleteInstanceSetting) error {
+	if err := s.driver.DeleteInstanceSetting(ctx, delete); err != nil {
+		return errors.Wrap(err, "failed to delete instance setting")
+	}
+
+	s.instanceSettingCache.Delete(ctx, delete.Name)
+	if delete.Name == storepb.InstanceSettingKey_STORAGE.String() {
+		s.resetStorageDriverCache()
+	}
+	return nil
 }
 
 func (s *Store) ListInstanceSettings(ctx context.Context, find *FindInstanceSetting) ([]*storepb.InstanceSetting, error) {
@@ -72,10 +111,26 @@ func (s *Store) ListInstanceSettings(ctx context.Context, find *FindInstanceSett
 		if instanceSetting == nil {
 			continue
 		}
-		s.instanceSettingCache.Set(ctx, instanceSetting.Key.String(), instanceSetting)
+		s.cacheInstanceSetting(ctx, instanceSetting)
 		instanceSettings = append(instanceSettings, instanceSetting)
 	}
 	return instanceSettings, nil
+}
+
+// GetUncachedInstanceSetting reads one setting from the database, bypassing
+// the instance setting cache.
+func (s *Store) GetUncachedInstanceSetting(ctx context.Context, find *FindInstanceSetting) (*storepb.InstanceSetting, error) {
+	list, err := s.ListInstanceSettings(ctx, find)
+	if err != nil {
+		return nil, err
+	}
+	if len(list) == 0 {
+		return nil, nil
+	}
+	if len(list) > 1 {
+		return nil, errors.Errorf("found multiple instance settings with key %s", find.Name)
+	}
+	return list[0], nil
 }
 
 func (s *Store) GetInstanceSetting(ctx context.Context, find *FindInstanceSetting) (*storepb.InstanceSetting, error) {
@@ -99,6 +154,13 @@ func (s *Store) GetInstanceSetting(ctx context.Context, find *FindInstanceSettin
 	return list[0], nil
 }
 
+func (s *Store) cacheInstanceSetting(ctx context.Context, setting *storepb.InstanceSetting) {
+	if setting == nil {
+		return
+	}
+	s.instanceSettingCache.Set(ctx, setting.Key.String(), setting)
+}
+
 func (s *Store) GetInstanceBasicSetting(ctx context.Context) (*storepb.InstanceBasicSetting, error) {
 	instanceSetting, err := s.GetInstanceSetting(ctx, &FindInstanceSetting{
 		Name: storepb.InstanceSettingKey_BASIC.String(),
@@ -111,7 +173,7 @@ func (s *Store) GetInstanceBasicSetting(ctx context.Context) (*storepb.InstanceB
 	if instanceSetting != nil {
 		instanceBasicSetting = instanceSetting.GetBasicSetting()
 	}
-	s.instanceSettingCache.Set(ctx, storepb.InstanceSettingKey_BASIC.String(), &storepb.InstanceSetting{
+	s.cacheInstanceSetting(ctx, &storepb.InstanceSetting{
 		Key:   storepb.InstanceSettingKey_BASIC,
 		Value: &storepb.InstanceSetting_BasicSetting{BasicSetting: instanceBasicSetting},
 	})
@@ -130,48 +192,108 @@ func (s *Store) GetInstanceGeneralSetting(ctx context.Context) (*storepb.Instanc
 	if instanceSetting != nil {
 		instanceGeneralSetting = instanceSetting.GetGeneralSetting()
 	}
-	s.instanceSettingCache.Set(ctx, storepb.InstanceSettingKey_GENERAL.String(), &storepb.InstanceSetting{
+	s.cacheInstanceSetting(ctx, &storepb.InstanceSetting{
 		Key:   storepb.InstanceSettingKey_GENERAL,
 		Value: &storepb.InstanceSetting_GeneralSetting{GeneralSetting: instanceGeneralSetting},
 	})
 	return instanceGeneralSetting, nil
 }
 
-// DefaultContentLengthLimit is the default limit of content length in bytes. 8KB.
-const DefaultContentLengthLimit = 8 * 1024
+// GetInstanceAccessSetting gets the instance access policy, defaulting to private.
+func (s *Store) GetInstanceAccessSetting(ctx context.Context) (*storepb.InstanceAccessSetting, error) {
+	// Access policy changes must take effect across replicas without waiting for
+	// the general instance-setting cache to expire.
+	instanceSetting, err := s.GetUncachedInstanceSetting(ctx, &FindInstanceSetting{Name: storepb.InstanceSettingKey_ACCESS.String()})
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to get instance access setting")
+	}
 
-// DefaultReactions is the default reactions for memo related setting.
-var DefaultReactions = []string{"👍", "👎", "❤️", "🎉", "😄", "😕", "😢", "😡"}
+	instanceAccessSetting := &storepb.InstanceAccessSetting{}
+	if instanceSetting != nil && instanceSetting.GetAccessSetting() != nil {
+		instanceAccessSetting = instanceSetting.GetAccessSetting()
+	}
+	if instanceAccessSetting.AccessMode == storepb.InstanceAccessMode_INSTANCE_ACCESS_MODE_UNSPECIFIED {
+		instanceAccessSetting.AccessMode = storepb.InstanceAccessMode_INSTANCE_ACCESS_MODE_PRIVATE
+	}
+	return instanceAccessSetting, nil
+}
 
-func (s *Store) GetInstanceMemoRelatedSetting(ctx context.Context) (*storepb.InstanceMemoRelatedSetting, error) {
+// AllowsAnonymousAccess reports whether the effective instance access policy is public.
+func (s *Store) AllowsAnonymousAccess(ctx context.Context) (bool, error) {
+	setting, err := s.GetInstanceAccessSetting(ctx)
+	if err != nil {
+		return false, err
+	}
+	return setting.AccessMode == storepb.InstanceAccessMode_INSTANCE_ACCESS_MODE_PUBLIC, nil
+}
+
+func (s *Store) GetInstanceTagsSetting(ctx context.Context) (*storepb.InstanceTagsSetting, error) {
 	instanceSetting, err := s.GetInstanceSetting(ctx, &FindInstanceSetting{
-		Name: storepb.InstanceSettingKey_MEMO_RELATED.String(),
+		Name: storepb.InstanceSettingKey_TAGS.String(),
 	})
 	if err != nil {
-		return nil, errors.Wrap(err, "failed to get instance general setting")
+		return nil, errors.Wrap(err, "failed to get instance tags setting")
 	}
 
-	instanceMemoRelatedSetting := &storepb.InstanceMemoRelatedSetting{}
+	instanceTagsSetting := &storepb.InstanceTagsSetting{}
 	if instanceSetting != nil {
-		instanceMemoRelatedSetting = instanceSetting.GetMemoRelatedSetting()
+		instanceTagsSetting = instanceSetting.GetTagsSetting()
 	}
-	if instanceMemoRelatedSetting.ContentLengthLimit < DefaultContentLengthLimit {
-		instanceMemoRelatedSetting.ContentLengthLimit = DefaultContentLengthLimit
+	if instanceTagsSetting.Tags == nil {
+		instanceTagsSetting.Tags = map[string]*storepb.InstanceTagMetadata{}
 	}
-	if len(instanceMemoRelatedSetting.Reactions) == 0 {
-		instanceMemoRelatedSetting.Reactions = append(instanceMemoRelatedSetting.Reactions, DefaultReactions...)
-	}
-	s.instanceSettingCache.Set(ctx, storepb.InstanceSettingKey_MEMO_RELATED.String(), &storepb.InstanceSetting{
-		Key:   storepb.InstanceSettingKey_MEMO_RELATED,
-		Value: &storepb.InstanceSetting_MemoRelatedSetting{MemoRelatedSetting: instanceMemoRelatedSetting},
+	s.cacheInstanceSetting(ctx, &storepb.InstanceSetting{
+		Key:   storepb.InstanceSettingKey_TAGS,
+		Value: &storepb.InstanceSetting_TagsSetting{TagsSetting: instanceTagsSetting},
 	})
-	return instanceMemoRelatedSetting, nil
+	return instanceTagsSetting, nil
+}
+
+func (s *Store) GetInstanceNotificationSetting(ctx context.Context) (*storepb.InstanceNotificationSetting, error) {
+	instanceSetting, err := s.GetInstanceSetting(ctx, &FindInstanceSetting{
+		Name: storepb.InstanceSettingKey_NOTIFICATION.String(),
+	})
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to get instance notification setting")
+	}
+
+	instanceNotificationSetting := &storepb.InstanceNotificationSetting{}
+	if instanceSetting != nil {
+		instanceNotificationSetting = instanceSetting.GetNotificationSetting()
+	}
+	if instanceNotificationSetting.Email == nil {
+		instanceNotificationSetting.Email = &storepb.InstanceNotificationSetting_EmailSetting{}
+	}
+	s.cacheInstanceSetting(ctx, &storepb.InstanceSetting{
+		Key:   storepb.InstanceSettingKey_NOTIFICATION,
+		Value: &storepb.InstanceSetting_NotificationSetting{NotificationSetting: instanceNotificationSetting},
+	})
+	return instanceNotificationSetting, nil
+}
+
+// GetInstanceAISetting gets the AI provider settings for the instance.
+func (s *Store) GetInstanceAISetting(ctx context.Context) (*storepb.InstanceAISetting, error) {
+	instanceSetting, err := s.GetInstanceSetting(ctx, &FindInstanceSetting{
+		Name: storepb.InstanceSettingKey_AI.String(),
+	})
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to get instance AI setting")
+	}
+
+	instanceAISetting := &storepb.InstanceAISetting{}
+	if instanceSetting != nil {
+		instanceAISetting = instanceSetting.GetAiSetting()
+	}
+	s.cacheInstanceSetting(ctx, &storepb.InstanceSetting{
+		Key:   storepb.InstanceSettingKey_AI,
+		Value: &storepb.InstanceSetting_AiSetting{AiSetting: instanceAISetting},
+	})
+	return instanceAISetting, nil
 }
 
 const (
-	defaultInstanceStorageType       = storepb.InstanceStorageSetting_DATABASE
-	defaultInstanceUploadSizeLimitMb = 30
-	defaultInstanceFilepathTemplate  = "assets/{timestamp}_{filename}"
+	defaultInstanceStorageType      = storepb.InstanceStorageSetting_LOCAL
+	defaultInstanceFilepathTemplate = "assets/{timestamp}_{uuid}_{filename}"
 )
 
 func (s *Store) GetInstanceStorageSetting(ctx context.Context) (*storepb.InstanceStorageSetting, error) {
@@ -182,23 +304,28 @@ func (s *Store) GetInstanceStorageSetting(ctx context.Context) (*storepb.Instanc
 		return nil, errors.Wrap(err, "failed to get instance storage setting")
 	}
 
+	stored := instanceSetting.GetStorageSetting()
 	instanceStorageSetting := &storepb.InstanceStorageSetting{}
-	if instanceSetting != nil {
-		instanceStorageSetting = instanceSetting.GetStorageSetting()
+	if stored != nil {
+		instanceStorageSetting = proto.CloneOf(stored)
 	}
+	NormalizeInstanceStorageSetting(instanceStorageSetting)
 	if instanceStorageSetting.StorageType == storepb.InstanceStorageSetting_STORAGE_TYPE_UNSPECIFIED {
 		instanceStorageSetting.StorageType = defaultInstanceStorageType
-	}
-	if instanceStorageSetting.UploadSizeLimitMb == 0 {
-		instanceStorageSetting.UploadSizeLimitMb = defaultInstanceUploadSizeLimitMb
 	}
 	if instanceStorageSetting.FilepathTemplate == "" {
 		instanceStorageSetting.FilepathTemplate = defaultInstanceFilepathTemplate
 	}
-	s.instanceSettingCache.Set(ctx, storepb.InstanceSettingKey_STORAGE.String(), &storepb.InstanceSetting{
-		Key:   storepb.InstanceSettingKey_STORAGE,
-		Value: &storepb.InstanceSetting_StorageSetting{StorageSetting: instanceStorageSetting},
-	})
+	// Only write back when normalization changed the cached value; on the common
+	// path the cache already holds the normalized setting.
+	if !proto.Equal(stored, instanceStorageSetting) {
+		s.cacheInstanceSetting(ctx, &storepb.InstanceSetting{
+			Key: storepb.InstanceSettingKey_STORAGE,
+			Value: &storepb.InstanceSetting_StorageSetting{
+				StorageSetting: proto.CloneOf(instanceStorageSetting),
+			},
+		})
+	}
 	return instanceStorageSetting, nil
 }
 
@@ -225,12 +352,36 @@ func convertInstanceSettingFromRaw(instanceSettingRaw *InstanceSetting) (*storep
 			return nil, err
 		}
 		instanceSetting.Value = &storepb.InstanceSetting_StorageSetting{StorageSetting: storageSetting}
-	case storepb.InstanceSettingKey_MEMO_RELATED.String():
-		memoRelatedSetting := &storepb.InstanceMemoRelatedSetting{}
-		if err := protojsonUnmarshaler.Unmarshal([]byte(instanceSettingRaw.Value), memoRelatedSetting); err != nil {
+	case storepb.InstanceSettingKey_TAGS.String():
+		tagsSetting := &storepb.InstanceTagsSetting{}
+		if err := protojsonUnmarshaler.Unmarshal([]byte(instanceSettingRaw.Value), tagsSetting); err != nil {
 			return nil, err
 		}
-		instanceSetting.Value = &storepb.InstanceSetting_MemoRelatedSetting{MemoRelatedSetting: memoRelatedSetting}
+		instanceSetting.Value = &storepb.InstanceSetting_TagsSetting{TagsSetting: tagsSetting}
+	case storepb.InstanceSettingKey_NOTIFICATION.String():
+		notificationSetting := &storepb.InstanceNotificationSetting{}
+		if err := protojsonUnmarshaler.Unmarshal([]byte(instanceSettingRaw.Value), notificationSetting); err != nil {
+			return nil, err
+		}
+		instanceSetting.Value = &storepb.InstanceSetting_NotificationSetting{NotificationSetting: notificationSetting}
+	case storepb.InstanceSettingKey_AI.String():
+		aiSetting := &storepb.InstanceAISetting{}
+		if err := protojsonUnmarshaler.Unmarshal([]byte(instanceSettingRaw.Value), aiSetting); err != nil {
+			return nil, err
+		}
+		instanceSetting.Value = &storepb.InstanceSetting_AiSetting{AiSetting: aiSetting}
+	case storepb.InstanceSettingKey_ACCESS.String():
+		accessSetting := &storepb.InstanceAccessSetting{}
+		if err := protojsonUnmarshaler.Unmarshal([]byte(instanceSettingRaw.Value), accessSetting); err != nil {
+			return nil, err
+		}
+		instanceSetting.Value = &storepb.InstanceSetting_AccessSetting{AccessSetting: accessSetting}
+	case storepb.InstanceSettingKey_USAGE_LIMITS.String():
+		usageLimitsSetting := &storepb.InstanceUsageLimitsSetting{}
+		if err := protojsonUnmarshaler.Unmarshal([]byte(instanceSettingRaw.Value), usageLimitsSetting); err != nil {
+			return nil, err
+		}
+		instanceSetting.Value = &storepb.InstanceSetting_UsageLimitsSetting{UsageLimitsSetting: usageLimitsSetting}
 	default:
 		// Skip unsupported instance setting key.
 		return nil, nil

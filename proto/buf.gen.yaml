@@ -14,7 +14,7 @@ plugins:
   - remote: buf.build/grpc/go
     out: gen
     opt: paths=source_relative
-  - remote: buf.build/connectrpc/go
+  - remote: buf.build/connectrpc/go:v1.20.0
     out: gen
     opt: paths=source_relative
   - remote: buf.build/grpc-ecosystem/gateway
@@ -23,7 +23,7 @@ plugins:
   - remote: buf.build/community/google-gnostic-openapi
     out: gen
     opt: enum_type=string
-  - remote: buf.build/bufbuild/es
+  - remote: buf.build/bufbuild/es:v2.12.1
     out: ../web/src/types/proto
     opt:
       - target=ts

@@ -1,57 +1,102 @@
-import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
-import useCurrentUser from "@/hooks/useCurrentUser";
+import { Toggle, Tooltip } from "@usememos/ui";
+import { useEffect, useId, useRef, useState } from "react";
+import { emojiName } from "@/lib/emoji";
 import { cn } from "@/lib/utils";
-import { State } from "@/types/proto/api/v1/common_pb";
-import type { Memo } from "@/types/proto/api/v1/memo_service_pb";
-import type { User } from "@/types/proto/api/v1/user_service_pb";
-import { formatReactionTooltip, useReactionActions } from "./hooks";
+import type { Memo } from "@/types/proto/api/memo_service_pb";
+import { useReactionActions } from "./hooks";
 
 interface Props {
   memo: Memo;
   reactionType: string;
-  users: User[];
+  count: number;
+  names: string[];
 }
 
-const ReactionView = (props: Props) => {
-  const { memo, reactionType, users } = props;
-  const currentUser = useCurrentUser();
-  const hasReaction = users.some((user) => currentUser && user.username === currentUser.username);
-  const readonly = memo.state === State.ARCHIVED;
-
-  const { handleReactionClick } = useReactionActions({ memo });
-
-  const handleClick = () => {
-    if (!currentUser || readonly) return;
-    handleReactionClick(reactionType);
-  };
-
-  const isClickable = currentUser && !readonly;
+const ReactionView = ({ memo, reactionType, count, names }: Props) => {
+  const { hasReacted, handleReactionClick, isPending, canReact, canWithdraw } = useReactionActions({ memo });
+  const pressed = hasReacted(reactionType);
+  const clickable = canReact || (canWithdraw && pressed);
+  const [open, setOpen] = useState(false);
+  const triggerId = useId();
+  const timer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const longPressed = useRef(false);
+  const clearTimer = () => clearTimeout(timer.current);
+  useEffect(() => clearTimer, []);
+  const label = (
+    <span className="inline-flex items-center gap-1">
+      <span className="mu-body">{reactionType}</span>
+      <span className="mu-caption tabular-nums">{count}</span>
+    </span>
+  );
+  const accessibleName = `${emojiName(reactionType)}: ${count} · ${names.join(", ")}`;
 
   return (
-    <TooltipProvider>
-      <Tooltip>
-        <TooltipTrigger asChild>
-          <button
-            type="button"
-            className={cn(
-              "h-7 border px-2 py-0.5 rounded-full flex flex-row justify-center items-center gap-1",
-              "text-sm text-muted-foreground",
-              isClickable && "cursor-pointer",
-              !isClickable && "cursor-default",
-              hasReaction && "bg-accent border-border",
-            )}
-            onClick={handleClick}
-            disabled={!isClickable}
-          >
-            <span>{reactionType}</span>
-            <span className="opacity-60">{users.length}</span>
-          </button>
-        </TooltipTrigger>
-        <TooltipContent>
-          <p>{formatReactionTooltip(users, reactionType)}</p>
-        </TooltipContent>
-      </Tooltip>
-    </TooltipProvider>
+    <Tooltip.Root open={open} onOpenChange={setOpen} triggerId={triggerId}>
+      <Tooltip.Trigger
+        id={triggerId}
+        onPointerDown={(event) => {
+          if (event.pointerType !== "touch") return;
+          longPressed.current = false;
+          clearTimer();
+          timer.current = setTimeout(() => {
+            longPressed.current = true;
+            setOpen(true);
+          }, 500);
+        }}
+        onPointerUp={() => {
+          clearTimer();
+          if (longPressed.current) timer.current = setTimeout(() => setOpen(false), 2000);
+        }}
+        onPointerCancel={() => {
+          clearTimer();
+          longPressed.current = false;
+          setOpen(false);
+        }}
+        onPointerLeave={() => {
+          clearTimer();
+          if (longPressed.current) setOpen(false);
+        }}
+        onContextMenu={(event) => {
+          if (longPressed.current) event.preventDefault();
+        }}
+        onClickCapture={(event) => {
+          if (longPressed.current) {
+            event.preventDefault();
+            event.stopPropagation();
+            longPressed.current = false;
+          }
+        }}
+        render={
+          clickable ? (
+            <Toggle
+              variant="soft"
+              shape="pill"
+              size="sm"
+              className="shrink-0"
+              aria-label={accessibleName}
+              aria-disabled={isPending}
+              pressed={pressed}
+              onPressedChange={() => {
+                handleReactionClick(reactionType);
+              }}
+            />
+          ) : (
+            <span
+              aria-label={accessibleName}
+              className={cn(
+                "inline-flex h-6 shrink-0 items-center rounded-mu-full px-2",
+                pressed ? "bg-mu-selected text-mu-text" : "bg-mu-hover text-mu-text-secondary",
+              )}
+            />
+          )
+        }
+      >
+        {label}
+      </Tooltip.Trigger>
+      <Tooltip.Popup className="max-w-64">
+        <p>{names.join(", ")}</p>
+      </Tooltip.Popup>
+    </Tooltip.Root>
   );
 };
 

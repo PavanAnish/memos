@@ -1,242 +1,439 @@
 import { create } from "@bufbuild/protobuf";
+import { Badge, Button, Checkbox, Field, Fieldset, Input, Radio, RadioGroup } from "@usememos/ui";
 import { isEqual } from "lodash-es";
+import { CloudIcon, DatabaseIcon, FolderIcon, LucideIcon } from "lucide-react";
 import React, { useEffect, useMemo, useState } from "react";
-import { toast } from "react-hot-toast";
-import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
-import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
-import { Switch } from "@/components/ui/switch";
+import { v4 as uuidv4 } from "uuid";
 import { useInstance } from "@/contexts/InstanceContext";
-import { handleError } from "@/lib/error";
+import { isFieldManaged, useManagedResource } from "@/hooks/useConfigurationQueries";
 import {
   InstanceSetting_Key,
+  InstanceSetting_Storage,
+  InstanceSetting_Storage_S3Config,
+  InstanceSetting_Storage_S3ConfigSchema,
+  InstanceSetting_StorageSchema,
   InstanceSetting_StorageSetting,
   InstanceSetting_StorageSetting_S3Config,
-  InstanceSetting_StorageSetting_S3ConfigSchema,
-  InstanceSetting_StorageSetting_StorageType,
   InstanceSetting_StorageSettingSchema,
+  InstanceSetting_StorageType,
   InstanceSettingSchema,
-} from "@/types/proto/api/v1/instance_service_pb";
+} from "@/types/proto/api/instance_service_pb";
 import { useTranslate } from "@/utils/i18n";
+import ManagedByConfigurationChip from "./ManagedByConfigurationChip";
 import SettingGroup from "./SettingGroup";
-import SettingRow from "./SettingRow";
+import { SettingList, SettingListItem } from "./SettingList";
 import SettingSection from "./SettingSection";
+import useInstanceSettingUpdater, { buildInstanceSettingName } from "./useInstanceSettingUpdater";
+
+const DEFAULT_FILEPATH_TEMPLATE = "assets/{timestamp}_{uuid}_{filename}";
+
+type StorageTypeOption = {
+  storageType: InstanceSetting_StorageType;
+  id: string;
+  titleKey: "setting.storage.type-database" | "setting.storage.type-local" | "setting.storage.type-s3";
+  descriptionKey: "setting.storage.database-description" | "setting.storage.local-description" | "setting.storage.s3-description";
+  noteKeys: readonly [
+    "setting.storage.database-note-backup" | "setting.storage.local-note-path" | "setting.storage.s3-note-scale",
+    "setting.storage.database-note-size" | "setting.storage.local-note-backup" | "setting.storage.s3-note-config",
+  ];
+  icon: LucideIcon;
+  badges?: readonly ("setting.storage.badge-default" | "setting.storage.badge-recommended")[];
+};
+
+const storageTypeOptions: StorageTypeOption[] = [
+  {
+    storageType: InstanceSetting_StorageType.LOCAL,
+    id: "storage-type-local",
+    titleKey: "setting.storage.type-local",
+    descriptionKey: "setting.storage.local-description",
+    noteKeys: ["setting.storage.local-note-path", "setting.storage.local-note-backup"],
+    icon: FolderIcon,
+    badges: ["setting.storage.badge-default", "setting.storage.badge-recommended"],
+  },
+  {
+    storageType: InstanceSetting_StorageType.DATABASE,
+    id: "storage-type-database",
+    titleKey: "setting.storage.type-database",
+    descriptionKey: "setting.storage.database-description",
+    noteKeys: ["setting.storage.database-note-backup", "setting.storage.database-note-size"],
+    icon: DatabaseIcon,
+  },
+  {
+    storageType: InstanceSetting_StorageType.S3,
+    id: "storage-type-s3",
+    titleKey: "setting.storage.type-s3",
+    descriptionKey: "setting.storage.s3-description",
+    noteKeys: ["setting.storage.s3-note-scale", "setting.storage.s3-note-config"],
+    icon: CloudIcon,
+  },
+];
+
+const getDefaultStorage = (setting: InstanceSetting_StorageSetting): InstanceSetting_Storage | undefined =>
+  setting.storages.find((storage) => storage.id === setting.defaultStorageId);
+
+const getSelectedStorageType = (setting: InstanceSetting_StorageSetting): InstanceSetting_StorageType =>
+  getDefaultStorage(setting)?.type ?? (setting.storageType as number as InstanceSetting_StorageType);
+
+const getS3Config = (
+  setting: InstanceSetting_StorageSetting,
+): InstanceSetting_Storage_S3Config | InstanceSetting_StorageSetting_S3Config | undefined => {
+  const storage = getDefaultStorage(setting);
+  if (storage?.config.case === "s3Config") {
+    return storage.config.value;
+  }
+  return setting.s3Config;
+};
+
+// The server keeps the storage registry ordered by most recent activation, so
+// the first storage of a type is the most recently used one.
+const findStorageForType = (
+  setting: InstanceSetting_StorageSetting,
+  storageType: InstanceSetting_StorageType,
+): InstanceSetting_Storage | undefined => setting.storages.find((storage) => storage.type === storageType);
+
+const normalizeEndpoint = (endpoint: string): string => endpoint.trim().replace(/\/+$/, "");
+
+const hasReusableS3Credential = (
+  setting: InstanceSetting_StorageSetting,
+  target: InstanceSetting_Storage_S3Config | InstanceSetting_StorageSetting_S3Config | undefined,
+): boolean => {
+  if (!target) {
+    return false;
+  }
+  // A credential can authorize multiple buckets, so match its provider scope
+  // rather than requiring the exact storage namespace.
+  const existingConfigs: (InstanceSetting_Storage_S3Config | InstanceSetting_StorageSetting_S3Config)[] = setting.storages
+    .map((storage) => (storage.config.case === "s3Config" ? storage.config.value : undefined))
+    .filter((config): config is InstanceSetting_Storage_S3Config => config !== undefined);
+  if (setting.s3Config) {
+    existingConfigs.push(setting.s3Config);
+  }
+  return existingConfigs.some(
+    (config) =>
+      config.accessKeyId === target.accessKeyId &&
+      normalizeEndpoint(config.endpoint) === normalizeEndpoint(target.endpoint) &&
+      config.region.trim() === target.region.trim(),
+  );
+};
+
+const createStorage = (storageType: InstanceSetting_StorageType): InstanceSetting_Storage => {
+  const storageTypeName = InstanceSetting_StorageType[storageType];
+  const id = storageType === InstanceSetting_StorageType.S3 ? `s3-${uuidv4()}` : storageTypeName.toLowerCase();
+  return create(InstanceSetting_StorageSchema, {
+    id,
+    name: storageType === InstanceSetting_StorageType.S3 ? "S3" : `${storageTypeName[0]}${storageTypeName.slice(1).toLowerCase()}`,
+    type: storageType,
+    config:
+      storageType === InstanceSetting_StorageType.S3
+        ? { case: "s3Config", value: create(InstanceSetting_Storage_S3ConfigSchema, {}) }
+        : { case: undefined },
+  });
+};
+
+// Browsing the storage-type options creates placeholder entries so the form has
+// something to select and edit. Only the selected storage and entries the server
+// already knows deserve to be persisted; abandoned placeholders are dropped.
+const canonicalizeStorageSetting = (
+  setting: InstanceSetting_StorageSetting,
+  original: InstanceSetting_StorageSetting,
+): InstanceSetting_StorageSetting => {
+  const originalIds = new Set(original.storages.map((storage) => storage.id));
+  return create(InstanceSetting_StorageSettingSchema, {
+    ...setting,
+    storages: setting.storages.filter((storage) => storage.id === setting.defaultStorageId || originalIds.has(storage.id)),
+  });
+};
 
 const StorageSection = () => {
   const t = useTranslate();
-  const { storageSetting: originalSetting, updateSetting, fetchSetting } = useInstance();
+  const managed = useManagedResource(buildInstanceSettingName(InstanceSetting_Key.STORAGE));
+  // The registry, its default, and the S3 fields are edited together, so they lock together.
+  const registryLocked = isFieldManaged(managed, "storageSetting.storages") || isFieldManaged(managed, "storageSetting.defaultStorageId");
+  const templateLocked = isFieldManaged(managed, "storageSetting.filepathTemplate");
+  const saveInstanceSetting = useInstanceSettingUpdater();
+  const { storageSetting: originalSetting } = useInstance();
   const [instanceStorageSetting, setInstanceStorageSetting] = useState<InstanceSetting_StorageSetting>(originalSetting);
+
+  const selectedStorageType = getSelectedStorageType(instanceStorageSetting);
+  const selectedS3Config = getS3Config(instanceStorageSetting);
+  const canReuseSelectedS3Secret = hasReusableS3Credential(originalSetting, selectedS3Config);
+
+  const selectedStorageOption = useMemo(
+    () => storageTypeOptions.find((option) => option.storageType === selectedStorageType) ?? storageTypeOptions[0],
+    [selectedStorageType],
+  );
+  const SelectedStorageIcon = selectedStorageOption.icon;
 
   useEffect(() => {
     setInstanceStorageSetting(originalSetting);
   }, [originalSetting]);
 
   const allowSaveStorageSetting = useMemo(() => {
-    if (instanceStorageSetting.uploadSizeLimitMb <= 0) {
-      return false;
-    }
-
-    if (instanceStorageSetting.storageType === InstanceSetting_StorageSetting_StorageType.LOCAL) {
+    if (selectedStorageType === InstanceSetting_StorageType.LOCAL) {
       if (instanceStorageSetting.filepathTemplate.length === 0) {
         return false;
       }
-    } else if (instanceStorageSetting.storageType === InstanceSetting_StorageSetting_StorageType.S3) {
+    } else if (selectedStorageType === InstanceSetting_StorageType.S3) {
       if (
-        instanceStorageSetting.s3Config?.accessKeyId.length === 0 ||
-        instanceStorageSetting.s3Config?.accessKeySecret.length === 0 ||
-        instanceStorageSetting.s3Config?.endpoint.length === 0 ||
-        instanceStorageSetting.s3Config?.region.length === 0 ||
-        instanceStorageSetting.s3Config?.bucket.length === 0
+        !instanceStorageSetting.filepathTemplate ||
+        !selectedS3Config?.accessKeyId ||
+        (!canReuseSelectedS3Secret && !selectedS3Config?.accessKeySecret) ||
+        !selectedS3Config?.endpoint ||
+        !selectedS3Config?.region ||
+        !selectedS3Config?.bucket
       ) {
         return false;
       }
     }
-    return !isEqual(originalSetting, instanceStorageSetting);
-  }, [instanceStorageSetting, originalSetting]);
+    return !isEqual(originalSetting, canonicalizeStorageSetting(instanceStorageSetting, originalSetting));
+  }, [canReuseSelectedS3Secret, instanceStorageSetting, originalSetting, selectedS3Config, selectedStorageType]);
 
-  const handleMaxUploadSizeChanged = async (event: React.FocusEvent<HTMLInputElement>) => {
-    let num = parseInt(event.target.value);
-    if (Number.isNaN(num)) {
-      num = 0;
-    }
-    const update = create(InstanceSetting_StorageSettingSchema, {
-      ...instanceStorageSetting,
-      uploadSizeLimitMb: BigInt(num),
-    });
-    setInstanceStorageSetting(update);
+  const handleFilepathTemplateChanged = (event: React.ChangeEvent<HTMLInputElement>) => {
+    setInstanceStorageSetting((current) =>
+      create(InstanceSetting_StorageSettingSchema, {
+        ...current,
+        filepathTemplate: event.target.value,
+      }),
+    );
   };
 
-  const handleFilepathTemplateChanged = async (event: React.FocusEvent<HTMLInputElement>) => {
-    const update = create(InstanceSetting_StorageSettingSchema, {
-      ...instanceStorageSetting,
-      filepathTemplate: event.target.value,
-    });
-    setInstanceStorageSetting(update);
-  };
-
-  const handlePartialS3ConfigChanged = async (s3Config: Partial<InstanceSetting_StorageSetting_S3Config>) => {
-    const existingS3Config = instanceStorageSetting.s3Config;
-    const s3ConfigInit = {
-      accessKeyId: existingS3Config?.accessKeyId ?? "",
-      accessKeySecret: existingS3Config?.accessKeySecret ?? "",
-      endpoint: existingS3Config?.endpoint ?? "",
-      region: existingS3Config?.region ?? "",
-      bucket: existingS3Config?.bucket ?? "",
-      usePathStyle: existingS3Config?.usePathStyle ?? false,
-      ...s3Config,
-    };
-    const update = create(InstanceSetting_StorageSettingSchema, {
-      storageType: instanceStorageSetting.storageType,
-      filepathTemplate: instanceStorageSetting.filepathTemplate,
-      uploadSizeLimitMb: instanceStorageSetting.uploadSizeLimitMb,
-      s3Config: create(InstanceSetting_StorageSetting_S3ConfigSchema, s3ConfigInit),
-    });
-    setInstanceStorageSetting(update);
-  };
-
-  const handleS3ConfigAccessKeyIdChanged = async (event: React.FocusEvent<HTMLInputElement>) => {
-    handlePartialS3ConfigChanged({ accessKeyId: event.target.value });
-  };
-
-  const handleS3ConfigAccessKeySecretChanged = async (event: React.FocusEvent<HTMLInputElement>) => {
-    handlePartialS3ConfigChanged({ accessKeySecret: event.target.value });
-  };
-
-  const handleS3ConfigEndpointChanged = async (event: React.FocusEvent<HTMLInputElement>) => {
-    handlePartialS3ConfigChanged({ endpoint: event.target.value });
-  };
-
-  const handleS3ConfigRegionChanged = async (event: React.FocusEvent<HTMLInputElement>) => {
-    handlePartialS3ConfigChanged({ region: event.target.value });
-  };
-
-  const handleS3ConfigBucketChanged = async (event: React.FocusEvent<HTMLInputElement>) => {
-    handlePartialS3ConfigChanged({ bucket: event.target.value });
-  };
-
-  const handleS3ConfigUsePathStyleChanged = (event: React.ChangeEvent<HTMLInputElement>) => {
-    handlePartialS3ConfigChanged({
-      usePathStyle: event.target.checked,
+  const handleS3FieldChange = (field: keyof InstanceSetting_StorageSetting_S3Config, value: string | boolean) => {
+    // Functional update: batched events (e.g. password-manager autofill firing
+    // several inputs in one task) must not overwrite one another.
+    setInstanceStorageSetting((current) => {
+      const existing = getS3Config(current);
+      let configuredStorage = getDefaultStorage(current);
+      if (configuredStorage?.type !== InstanceSetting_StorageType.S3) {
+        configuredStorage = findStorageForType(current, InstanceSetting_StorageType.S3) ?? createStorage(InstanceSetting_StorageType.S3);
+      }
+      const updatedStorage = create(InstanceSetting_StorageSchema, {
+        ...configuredStorage,
+        config: {
+          case: "s3Config",
+          value: create(InstanceSetting_Storage_S3ConfigSchema, {
+            accessKeyId: existing?.accessKeyId ?? "",
+            accessKeySecret: existing?.accessKeySecret ?? "",
+            endpoint: existing?.endpoint ?? "",
+            region: existing?.region ?? "",
+            bucket: existing?.bucket ?? "",
+            usePathStyle: existing?.usePathStyle ?? false,
+            insecureSkipTlsVerify: existing?.insecureSkipTlsVerify ?? false,
+            [field]: value,
+          }),
+        },
+      });
+      // Replace in place to preserve the registry order the server maintains.
+      // The legacy storageType/s3Config mirror fields are left untouched: the
+      // server re-derives them from the named model on every update.
+      const storages = current.storages.some((storage) => storage.id === updatedStorage.id)
+        ? current.storages.map((storage) => (storage.id === updatedStorage.id ? updatedStorage : storage))
+        : [updatedStorage, ...current.storages];
+      return create(InstanceSetting_StorageSettingSchema, {
+        ...current,
+        storages,
+        defaultStorageId: updatedStorage.id,
+      });
     });
   };
 
-  const handleStorageTypeChanged = async (storageType: InstanceSetting_StorageSetting_StorageType) => {
-    const update = create(InstanceSetting_StorageSettingSchema, {
-      ...instanceStorageSetting,
-      storageType: storageType,
+  const handleStorageTypeChanged = (storageType: InstanceSetting_StorageType) => {
+    setInstanceStorageSetting((current) => {
+      const configuredStorage = findStorageForType(current, storageType) ?? createStorage(storageType);
+      const storages = current.storages.some((storage) => storage.id === configuredStorage.id)
+        ? current.storages
+        : [...current.storages, configuredStorage];
+      return create(InstanceSetting_StorageSettingSchema, {
+        ...current,
+        storages,
+        defaultStorageId: configuredStorage.id,
+        filepathTemplate: current.filepathTemplate || DEFAULT_FILEPATH_TEMPLATE,
+      });
     });
-    setInstanceStorageSetting(update);
   };
 
   const saveInstanceStorageSetting = async () => {
-    try {
-      await updateSetting(
-        create(InstanceSettingSchema, {
-          name: `instance/settings/${InstanceSetting_Key[InstanceSetting_Key.STORAGE]}`,
-          value: {
-            case: "storageSetting",
-            value: instanceStorageSetting,
-          },
-        }),
-      );
-      await fetchSetting(InstanceSetting_Key.STORAGE);
-      toast.success("Updated");
-    } catch (error: unknown) {
-      handleError(error, toast.error, {
-        context: "Update storage settings",
-      });
-    }
+    await saveInstanceSetting({
+      key: InstanceSetting_Key.STORAGE,
+      setting: create(InstanceSettingSchema, {
+        name: buildInstanceSettingName(InstanceSetting_Key.STORAGE),
+        value: {
+          case: "storageSetting",
+          value: canonicalizeStorageSetting(instanceStorageSetting, originalSetting),
+        },
+      }),
+      errorContext: "Update storage settings",
+    });
   };
 
   return (
-    <SettingSection>
-      <SettingGroup title={t("setting.storage-section.current-storage")}>
-        <div className="w-full">
-          <RadioGroup
-            value={String(instanceStorageSetting.storageType)}
-            onValueChange={(value) => {
-              handleStorageTypeChanged(Number(value) as InstanceSetting_StorageSetting_StorageType);
-            }}
-            className="flex flex-row gap-4"
+    <SettingSection title={t("setting.storage.label")}>
+      <SettingGroup
+        title={t("setting.storage.current-storage")}
+        description={t("setting.storage.current-storage-description")}
+        actions={registryLocked || templateLocked ? <ManagedByConfigurationChip resource={managed} /> : undefined}
+      >
+        <Field.Root disabled={registryLocked}>
+          <Fieldset.Root
+            render={
+              <RadioGroup
+                value={String(selectedStorageType)}
+                onValueChange={(value) => handleStorageTypeChanged(Number(value) as InstanceSetting_StorageType)}
+              />
+            }
           >
-            <div className="flex items-center space-x-2">
-              <RadioGroupItem value={String(InstanceSetting_StorageSetting_StorageType.DATABASE)} id="database" />
-              <Label htmlFor="database">{t("setting.storage-section.type-database")}</Label>
-            </div>
-            <div className="flex items-center space-x-2">
-              <RadioGroupItem value={String(InstanceSetting_StorageSetting_StorageType.LOCAL)} id="local" />
-              <Label htmlFor="local">{t("setting.storage-section.type-local")}</Label>
-            </div>
-            <div className="flex items-center space-x-2">
-              <RadioGroupItem value={String(InstanceSetting_StorageSetting_StorageType.S3)} id="s3" />
-              <Label htmlFor="s3">S3</Label>
-            </div>
-          </RadioGroup>
+            <Fieldset.Legend className="mu-visually-hidden">{t("setting.storage.current-storage")}</Fieldset.Legend>
+            {storageTypeOptions.map((option) => {
+              const Icon = option.icon;
+              return (
+                <Field.Item key={option.id}>
+                  <Field.Label className="items-start">
+                    <Radio value={String(option.storageType)} className="mt-0.5" />
+                    <span className="grid min-w-0 flex-1 gap-1 sm:grid-cols-[minmax(12rem,16rem)_1fr] sm:gap-5">
+                      <span className="flex min-w-0 flex-col gap-1">
+                        <span className="flex min-w-0 items-center gap-2">
+                          <Icon className="mu-icon shrink-0 text-mu-text-secondary" />
+                          <span className="truncate text-mu-text">{t(option.titleKey)}</span>
+                        </span>
+                        {option.badges && (
+                          <span className="flex flex-wrap gap-1.5 ps-6">
+                            {option.badges.map((badge) => (
+                              <Badge key={badge} size="xs" tone={badge === "setting.storage.badge-recommended" ? "neutral" : "outline"}>
+                                {t(badge)}
+                              </Badge>
+                            ))}
+                          </span>
+                        )}
+                      </span>
+                      <span className="mu-caption text-mu-text-secondary">{t(option.descriptionKey)}</span>
+                    </span>
+                  </Field.Label>
+                </Field.Item>
+              );
+            })}
+          </Fieldset.Root>
+        </Field.Root>
+
+        <div>
+          <div className="mb-2 flex items-center gap-2 mu-label-sm text-mu-text-secondary">
+            <SelectedStorageIcon className="mu-icon-sm" />
+            <span>{t("setting.storage.current-storage")}</span>
+            <span className="text-mu-text">{t(selectedStorageOption.titleKey)}</span>
+          </div>
+          <ul className="flex flex-col gap-1.5 mu-caption text-mu-text-secondary">
+            {selectedStorageOption.noteKeys.map((note) => (
+              <li key={note} className="flex gap-2">
+                <span className="mt-2 size-1 rounded-full bg-mu-text-secondary/60" aria-hidden />
+                <span>{t(note)}</span>
+              </li>
+            ))}
+          </ul>
         </div>
 
-        <SettingRow label={t("setting.system-section.max-upload-size")} tooltip={t("setting.system-section.max-upload-size-hint")}>
-          <Input
-            className="w-24 font-mono"
-            value={String(instanceStorageSetting.uploadSizeLimitMb)}
-            onChange={handleMaxUploadSizeChanged}
-          />
-        </SettingRow>
-
-        {instanceStorageSetting.storageType !== InstanceSetting_StorageSetting_StorageType.DATABASE && (
-          <SettingRow label={t("setting.storage-section.filepath-template")}>
-            <Input
-              className="w-64"
-              value={instanceStorageSetting.filepathTemplate}
-              placeholder="assets/{timestamp}_{filename}"
-              onChange={handleFilepathTemplateChanged}
-            />
-          </SettingRow>
+        {selectedStorageType !== InstanceSetting_StorageType.DATABASE && (
+          <SettingList>
+            <SettingListItem
+              label={t("setting.storage.filepath-template")}
+              description={t("setting.storage.filepath-template-description")}
+              orientation="vertical"
+            >
+              <Input
+                className="w-full max-w-lg font-mono"
+                value={instanceStorageSetting.filepathTemplate}
+                disabled={templateLocked}
+                placeholder={DEFAULT_FILEPATH_TEMPLATE}
+                onChange={handleFilepathTemplateChanged}
+              />
+            </SettingListItem>
+          </SettingList>
         )}
       </SettingGroup>
 
-      {instanceStorageSetting.storageType === InstanceSetting_StorageSetting_StorageType.S3 && (
-        <SettingGroup title="S3 Configuration" showSeparator>
-          <SettingRow label="Access key id">
-            <Input className="w-64" value={instanceStorageSetting.s3Config?.accessKeyId} onChange={handleS3ConfigAccessKeyIdChanged} />
-          </SettingRow>
+      {selectedStorageType === InstanceSetting_StorageType.S3 && (
+        <SettingGroup
+          title={t("setting.storage.s3-configuration")}
+          description={t("setting.storage.s3-configuration-description")}
+          showSeparator
+        >
+          <SettingList>
+            <SettingListItem label={t("setting.storage.accesskey")} description={t("setting.storage.accesskey-description")}>
+              <Input
+                className="w-full max-w-full sm:w-64"
+                value={selectedS3Config?.accessKeyId ?? ""}
+                disabled={registryLocked}
+                onChange={(e) => handleS3FieldChange("accessKeyId", e.target.value)}
+              />
+            </SettingListItem>
 
-          <SettingRow label="Access key secret">
-            <Input
-              className="w-64"
-              type="password"
-              value={instanceStorageSetting.s3Config?.accessKeySecret}
-              onChange={handleS3ConfigAccessKeySecretChanged}
-            />
-          </SettingRow>
-
-          <SettingRow label="Endpoint">
-            <Input className="w-64" value={instanceStorageSetting.s3Config?.endpoint} onChange={handleS3ConfigEndpointChanged} />
-          </SettingRow>
-
-          <SettingRow label="Region">
-            <Input className="w-64" value={instanceStorageSetting.s3Config?.region} onChange={handleS3ConfigRegionChanged} />
-          </SettingRow>
-
-          <SettingRow label="Bucket">
-            <Input className="w-64" value={instanceStorageSetting.s3Config?.bucket} onChange={handleS3ConfigBucketChanged} />
-          </SettingRow>
-
-          <SettingRow label="Use Path Style">
-            <Switch
-              checked={instanceStorageSetting.s3Config?.usePathStyle}
-              onCheckedChange={(checked) =>
-                handleS3ConfigUsePathStyleChanged({ target: { checked } } as React.ChangeEvent<HTMLInputElement> & {
-                  target: { checked: boolean };
-                })
+            <SettingListItem
+              label={t("setting.storage.secretkey")}
+              description={
+                canReuseSelectedS3Secret ? t("setting.storage.secretkey-preserve-description") : t("setting.storage.secretkey-description")
               }
-            />
-          </SettingRow>
+            >
+              <Input
+                className="w-full max-w-full sm:w-64"
+                type="password"
+                value={selectedS3Config?.accessKeySecret ?? ""}
+                disabled={registryLocked}
+                onChange={(e) => handleS3FieldChange("accessKeySecret", e.target.value)}
+              />
+            </SettingListItem>
+
+            <SettingListItem label={t("setting.storage.endpoint")} description={t("setting.storage.endpoint-description")}>
+              <Input
+                className="w-full max-w-full sm:w-64"
+                value={selectedS3Config?.endpoint ?? ""}
+                disabled={registryLocked}
+                onChange={(e) => handleS3FieldChange("endpoint", e.target.value)}
+              />
+            </SettingListItem>
+
+            <SettingListItem label={t("setting.storage.region")} description={t("setting.storage.region-description")}>
+              <Input
+                className="w-full max-w-full sm:w-64"
+                value={selectedS3Config?.region ?? ""}
+                disabled={registryLocked}
+                onChange={(e) => handleS3FieldChange("region", e.target.value)}
+              />
+            </SettingListItem>
+
+            <SettingListItem label={t("setting.storage.bucket")} description={t("setting.storage.bucket-description")}>
+              <Input
+                className="w-full max-w-full sm:w-64"
+                value={selectedS3Config?.bucket ?? ""}
+                disabled={registryLocked}
+                onChange={(e) => handleS3FieldChange("bucket", e.target.value)}
+              />
+            </SettingListItem>
+
+            <SettingListItem label={t("setting.storage.use-path-style")} description={t("setting.storage.use-path-style-description")}>
+              <Checkbox
+                checked={selectedS3Config?.usePathStyle ?? false}
+                disabled={registryLocked}
+                onCheckedChange={(checked) => handleS3FieldChange("usePathStyle", checked)}
+              />
+            </SettingListItem>
+
+            <SettingListItem
+              label={t("setting.storage.insecure-skip-tls-verify")}
+              description={t("setting.storage.insecure-skip-tls-verify-description")}
+            >
+              <Checkbox
+                checked={selectedS3Config?.insecureSkipTlsVerify ?? false}
+                disabled={registryLocked}
+                onCheckedChange={(checked) => handleS3FieldChange("insecureSkipTlsVerify", checked)}
+              />
+            </SettingListItem>
+          </SettingList>
         </SettingGroup>
       )}
 
       <div className="w-full flex justify-end">
-        <Button disabled={!allowSaveStorageSetting} onClick={saveInstanceStorageSetting}>
+        <Button
+          variant="primary"
+          disabled={(registryLocked && templateLocked) || !allowSaveStorageSetting}
+          onClick={saveInstanceStorageSetting}
+        >
           {t("common.save")}
         </Button>
       </div>

@@ -2,6 +2,7 @@ package mysql
 
 import (
 	"context"
+	"database/sql"
 	"strings"
 
 	"github.com/pkg/errors"
@@ -57,6 +58,22 @@ func (d *DB) ListUserSettings(ctx context.Context, find *store.FindUserSetting) 
 	return userSettingList, nil
 }
 
+func (d *DB) DeleteUserSettings(ctx context.Context, delete *store.DeleteUserSetting) error {
+	where, args := []string{"1 = 1"}, []any{}
+
+	if v := delete.Key; v != storepb.UserSetting_KEY_UNSPECIFIED {
+		where, args = append(where, "`key` = ?"), append(args, v.String())
+	}
+	if v := delete.UserID; v != nil {
+		where, args = append(where, "`user_id` = ?"), append(args, *v)
+	}
+
+	if _, err := d.db.ExecContext(ctx, "DELETE FROM `user_setting` WHERE "+strings.Join(where, " AND "), args...); err != nil {
+		return err
+	}
+	return nil
+}
+
 func (d *DB) GetUserByPATHash(ctx context.Context, tokenHash string) (*store.PATQueryResult, error) {
 	query := `
 		SELECT
@@ -72,6 +89,9 @@ func (d *DB) GetUserByPATHash(ctx context.Context, tokenHash string) (*store.PAT
 
 	err := d.db.QueryRowContext(ctx, query, tokenHash).Scan(&userID, &tokensJSON)
 	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
 		return nil, err
 	}
 
@@ -89,5 +109,5 @@ func (d *DB) GetUserByPATHash(ctx context.Context, tokenHash string) (*store.PAT
 		}
 	}
 
-	return nil, errors.New("PAT not found")
+	return nil, nil
 }

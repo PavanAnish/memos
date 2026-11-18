@@ -1,17 +1,20 @@
+import { ArchiveIcon } from "lucide-react";
 import MemoView from "@/components/MemoView";
-import PagedMemoList from "@/components/PagedMemoList";
+import PagedMemoList, { getMemoKey } from "@/components/PagedMemoList";
 import { useMemoFilters, useMemoSorting } from "@/hooks";
 import useCurrentUser from "@/hooks/useCurrentUser";
-import { State } from "@/types/proto/api/v1/common_pb";
-import { Memo } from "@/types/proto/api/v1/memo_service_pb";
+import { cn } from "@/lib/utils";
+import { State } from "@/types/proto/api/common_pb";
+import { Memo } from "@/types/proto/api/memo_service_pb";
+import { useTranslate } from "@/utils/i18n";
 
 const Archived = () => {
   const user = useCurrentUser();
+  const t = useTranslate();
 
-  // Build filter using unified hook (no shortcuts or pinned filter)
   const memoFilter = useMemoFilters({
     creatorName: user?.name,
-    includeShortcuts: false,
+    includeMemoViews: true,
     includePinned: false,
   });
 
@@ -23,11 +26,17 @@ const Archived = () => {
 
   return (
     <PagedMemoList
-      renderer={(memo: Memo) => <MemoView key={`${memo.name}-${memo.updateTime}`} memo={memo} showVisibility compact />}
+      renderer={(memo: Memo, { compact }) => <MemoView key={getMemoKey(memo)} memo={memo} showVisibility showSpace compact={compact} />}
       listSort={listSort}
       state={State.ARCHIVED}
       orderBy={orderBy}
       filter={memoFilter}
+      renderLeading={({ useGrid }) => (
+        <header className={cn("flex items-center gap-2 px-1", !useGrid && "mb-4")}>
+          <ArchiveIcon className="mu-icon size-5 text-mu-text-secondary" />
+          <h1 className="mu-heading text-mu-text">{t("common.archived")}</h1>
+        </header>
+      )}
     />
   );
 };

@@ -1,9 +1,11 @@
 package store
 
 import (
+	"sync"
 	"time"
 
 	"github.com/usememos/memos/internal/profile"
+	"github.com/usememos/memos/provider/storage"
 	"github.com/usememos/memos/store/cache"
 )
 
@@ -12,6 +14,12 @@ type Store struct {
 	profile *profile.Profile
 	driver  Driver
 
+	userCreateMu   sync.Mutex
+	authConfigMu   sync.Mutex
+	refreshTokenMu sync.Mutex
+	patMu          sync.Mutex
+	memoViewMu     sync.Mutex
+
 	// Cache settings
 	cacheConfig cache.Config
 
@@ -19,6 +27,12 @@ type Store struct {
 	instanceSettingCache *cache.Cache // cache for instance settings
 	userCache            *cache.Cache // cache for users
 	userSettingCache     *cache.Cache // cache for user settings
+
+	// storageDriverCache reuses object-storage clients across requests, keyed
+	// by the resolved configuration. Reset whenever the STORAGE setting changes.
+	storageDriverMu         sync.Mutex
+	storageDriverGeneration uint64
+	storageDriverCache      map[storageDriverCacheKey]storage.Driver
 }
 
 // New creates a new instance of Store.
@@ -45,6 +59,11 @@ func New(driver Driver, profile *profile.Profile) *Store {
 
 func (s *Store) GetDriver() Driver {
 	return s.driver
+}
+
+// GetDataDir returns the store data directory.
+func (s *Store) GetDataDir() string {
+	return s.profile.Data
 }
 
 func (s *Store) Close() error {

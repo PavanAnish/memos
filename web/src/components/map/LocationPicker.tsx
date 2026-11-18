@@ -1,53 +1,50 @@
 import L, { LatLng } from "leaflet";
+import "leaflet/dist/leaflet.css";
 import { ExternalLinkIcon, MinusIcon, PlusIcon } from "lucide-react";
-import { type ReactNode, useEffect, useRef, useState } from "react";
-import { createRoot } from "react-dom/client";
+import { type ReactNode, useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { MapContainer, Marker, useMap, useMapEvents } from "react-leaflet";
 import { cn } from "@/lib/utils";
-import { defaultMarkerIcon, ThemedTileLayer } from "./map-utils";
+import { useTranslate } from "@/utils/i18n";
+import { BasemapLayer } from "./BasemapLayer";
+import { defaultMarkerIcon, MinimalAttributionControl } from "./map-utils";
+import type { MapPoint } from "./types";
 
-interface MarkerProps {
+const toLatLng = (point: MapPoint): LatLng => new LatLng(point.lat, point.lng);
+const fromLatLng = (latlng: LatLng): MapPoint => ({ lat: latlng.lat, lng: latlng.lng });
+
+interface LocationMarkerProps {
   position: LatLng | undefined;
-  onChange: (position: LatLng) => void;
+  onChange: (position: MapPoint) => void;
   readonly?: boolean;
 }
 
-const LocationMarker = (props: MarkerProps) => {
-  const [position, setPosition] = useState(props.position);
-  const initializedRef = useRef(false);
+const LocationMarker = ({ position: initialPosition, onChange, readonly: readOnly }: LocationMarkerProps) => {
+  const [position, setPosition] = useState(initialPosition);
 
   const map = useMapEvents({
     click(e) {
-      if (props.readonly) {
+      if (readOnly) {
         return;
       }
 
       setPosition(e.latlng);
-      map.locate();
-      // Call the parent onChange function.
-      props.onChange(e.latlng);
+      onChange(fromLatLng(e.latlng));
     },
-    locationfound() {},
   });
 
   useEffect(() => {
-    if (!initializedRef.current) {
-      map.locate();
-      initializedRef.current = true;
-    }
-  }, [map]);
-
-  // Keep marker and map in sync with external position updates
-  useEffect(() => {
-    if (props.position) {
-      setPosition(props.position);
-      map.setView(props.position);
+    if (initialPosition) {
+      setPosition(initialPosition);
+      map.setView(initialPosition);
     } else {
       setPosition(undefined);
     }
-  }, [props.position, map]);
+  }, [initialPosition, map]);
 
-  return position === undefined ? null : <Marker position={position} icon={defaultMarkerIcon}></Marker>;
+  return position === undefined ? null : (
+    <Marker position={position} icon={defaultMarkerIcon} interactive={false} keyboard={false}></Marker>
+  );
 };
 
 // Reusable glass-style button component
@@ -66,12 +63,10 @@ const GlassButton = ({ icon, onClick, ariaLabel, title }: GlassButtonProps) => {
       aria-label={ariaLabel}
       title={title}
       className={cn(
-        "h-8 w-8 flex items-center justify-center rounded-lg",
-        "cursor-pointer transition-all duration-200",
-        "bg-white/80 backdrop-blur-md border border-white/30 shadow-lg",
-        "hover:bg-white/90 hover:scale-105 active:scale-95",
-        "dark:bg-black/80 dark:border-white/10 dark:hover:bg-black/90",
-        "focus:outline-none focus:ring-2 focus:ring-blue-500",
+        "inline-flex items-center justify-center h-8 w-8 rounded-mu-lg",
+        "border border-mu-line/80 bg-mu-canvas/88 text-mu-text backdrop-blur-md",
+        "hover:scale-105 hover:bg-mu-canvas active:scale-95",
+        "mu-focus focus-visible:border-mu-focus",
       )}
     >
       {icon}
@@ -81,25 +76,36 @@ const GlassButton = ({ icon, onClick, ariaLabel, title }: GlassButtonProps) => {
 
 // Container for all map control buttons
 interface ControlButtonsProps {
-  position: LatLng | undefined;
+  position: MapPoint | undefined;
   onZoomIn: () => void;
   onZoomOut: () => void;
   onOpenGoogleMaps: () => void;
 }
 
 const ControlButtons = ({ position, onZoomIn, onZoomOut, onOpenGoogleMaps }: ControlButtonsProps) => {
+  const t = useTranslate();
   return (
     <div className="flex flex-col gap-1.5">
       {position && (
         <GlassButton
-          icon={<ExternalLinkIcon size={16} className="text-foreground" />}
+          icon={<ExternalLinkIcon size={16} className="text-mu-text" />}
           onClick={onOpenGoogleMaps}
-          ariaLabel="Open location in Google Maps"
-          title="Open in Google Maps"
+          ariaLabel={t("map.open-in-google-maps")}
+          title={t("map.open-in-google-maps")}
         />
       )}
-      <GlassButton icon={<PlusIcon size={16} className="text-foreground" />} onClick={onZoomIn} ariaLabel="Zoom in" title="Zoom in" />
-      <GlassButton icon={<MinusIcon size={16} className="text-foreground" />} onClick={onZoomOut} ariaLabel="Zoom out" title="Zoom out" />
+      <GlassButton
+        icon={<PlusIcon size={16} className="text-mu-text" />}
+        onClick={onZoomIn}
+        ariaLabel={t("map.zoom-in")}
+        title={t("map.zoom-in")}
+      />
+      <GlassButton
+        icon={<MinusIcon size={16} className="text-mu-text" />}
+        onClick={onZoomOut}
+        ariaLabel={t("map.zoom-out")}
+        title={t("map.zoom-out")}
+      />
     </div>
   );
 };
@@ -129,13 +135,13 @@ class MapControlsContainer extends L.Control {
 }
 
 interface MapControlsProps {
-  position: LatLng | undefined;
+  position: MapPoint | undefined;
 }
 
 const MapControls = ({ position }: MapControlsProps) => {
   const map = useMap();
   const controlRef = useRef<MapControlsContainer | null>(null);
-  const rootRef = useRef<ReturnType<typeof createRoot> | null>(null);
+  const [container, setContainer] = useState<HTMLDivElement | null>(null);
 
   const handleOpenInGoogleMaps = () => {
     if (!position) return;
@@ -156,39 +162,25 @@ const MapControls = ({ position }: MapControlsProps) => {
     const control = new MapControlsContainer({ position: "topright" });
     controlRef.current = control;
     control.addTo(map);
-
-    // Get container and render React component into it
-    const container = control.getContainer();
-    if (container) {
-      rootRef.current = createRoot(container);
-      rootRef.current.render(
-        <ControlButtons position={position} onZoomIn={handleZoomIn} onZoomOut={handleZoomOut} onOpenGoogleMaps={handleOpenInGoogleMaps} />,
-      );
-    }
+    setContainer(control.getContainer() ?? null);
 
     return () => {
-      // Cleanup: unmount React component and remove control
-      if (rootRef.current) {
-        rootRef.current.unmount();
-        rootRef.current = null;
-      }
       if (controlRef.current) {
         controlRef.current.remove();
         controlRef.current = null;
       }
+      setContainer(null);
     };
   }, [map]);
 
-  // Update rendered content when position changes
-  useEffect(() => {
-    if (rootRef.current) {
-      rootRef.current.render(
-        <ControlButtons position={position} onZoomIn={handleZoomIn} onZoomOut={handleZoomOut} onOpenGoogleMaps={handleOpenInGoogleMaps} />,
-      );
-    }
-  }, [position]);
+  if (!container) {
+    return null;
+  }
 
-  return null;
+  return createPortal(
+    <ControlButtons position={position} onZoomIn={handleZoomIn} onZoomOut={handleZoomOut} onOpenGoogleMaps={handleOpenInGoogleMaps} />,
+    container,
+  );
 };
 
 const MapCleanup = () => {
@@ -212,32 +204,53 @@ const MapCleanup = () => {
   return null;
 };
 
-interface MapProps {
+interface LocationPickerProps {
   readonly?: boolean;
-  latlng?: LatLng;
-  onChange?: (position: LatLng) => void;
+  latlng?: MapPoint;
+  onChange?: (position: MapPoint) => void;
+  className?: string;
 }
 
-const DEFAULT_CENTER_LAT_LNG = new LatLng(48.8584, 2.2945);
+const DEFAULT_CENTER: MapPoint = { lat: 48.8584, lng: 2.2945 };
+const noopOnLocationChange = () => {};
 
-const LeafletMap = (props: MapProps) => {
-  const position = props.latlng || DEFAULT_CENTER_LAT_LNG;
+const LocationPicker = ({ readonly: readOnly = false, latlng, onChange = noopOnLocationChange, className }: LocationPickerProps) => {
+  const mapCenter = useMemo(() => toLatLng(latlng ?? DEFAULT_CENTER), [latlng?.lat, latlng?.lng]);
+  const markerPosition = latlng ? mapCenter : undefined;
+  const t = useTranslate();
+  const statusLabel = latlng ? t("common.selected-location") : t("common.choose-location");
 
   return (
-    <MapContainer
-      className="w-full h-72"
-      center={position}
-      zoom={13}
-      scrollWheelZoom={false}
-      zoomControl={false}
-      attributionControl={false}
+    <div
+      className={cn(
+        "memo-location-map relative isolate h-72 w-full overflow-hidden rounded-mu-xl border border-mu-line bg-mu-canvas ",
+        className,
+      )}
     >
-      <ThemedTileLayer />
-      <LocationMarker position={position} readonly={props.readonly} onChange={props.onChange ? props.onChange : () => {}} />
-      <MapControls position={props.latlng} />
-      <MapCleanup />
-    </MapContainer>
+      <MapContainer
+        className="map-attribution-minimal h-full w-full !bg-mu-well"
+        center={mapCenter}
+        zoom={13}
+        scrollWheelZoom={false}
+        zoomControl={false}
+        attributionControl={false}
+      >
+        <MinimalAttributionControl />
+        <BasemapLayer />
+        <LocationMarker position={markerPosition} readonly={readOnly} onChange={onChange} />
+        <MapControls position={latlng} />
+        <MapCleanup />
+      </MapContainer>
+
+      {!readOnly && (
+        <div className="pointer-events-none absolute left-3 top-3 z-[450] flex items-center gap-2">
+          <div className="rounded-full border border-mu-line bg-mu-canvas/92 px-2.5 py-1 mu-label-sm tracking-[0.02em] text-mu-text/80 backdrop-blur-sm">
+            {statusLabel}
+          </div>
+        </div>
+      )}
+    </div>
   );
 };
 
-export default LeafletMap;
+export default LocationPicker;

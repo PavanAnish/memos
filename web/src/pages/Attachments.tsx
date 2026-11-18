@@ -1,278 +1,264 @@
-import { timestampDate } from "@bufbuild/protobuf/wkt";
-import dayjs from "dayjs";
-import { ExternalLinkIcon, PaperclipIcon, SearchIcon, Trash } from "lucide-react";
-import { useCallback, useEffect, useMemo, useState } from "react";
-import { toast } from "react-hot-toast";
-import { Link } from "react-router-dom";
-import AttachmentIcon from "@/components/AttachmentIcon";
+import { create } from "@bufbuild/protobuf";
+import { Button } from "@usememos/ui";
+import { Trash2Icon } from "lucide-react";
+import { useEffect, useMemo, useState } from "react";
+import {
+  AttachmentAudioRows,
+  AttachmentDocumentRows,
+  AttachmentLibraryEmptyState,
+  AttachmentLibraryErrorState,
+  AttachmentLibrarySkeletonGrid,
+  AttachmentMediaGrid,
+  AttachmentUnusedRows,
+} from "@/components/AttachmentLibrary";
 import ConfirmDialog from "@/components/ConfirmDialog";
-import Empty from "@/components/Empty";
-import MobileHeader from "@/components/MobileHeader";
-import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
-import { Separator } from "@/components/ui/separator";
+import PreviewImageDialog from "@/components/PreviewImageDialog";
 import { attachmentServiceClient } from "@/connect";
-import { useDeleteAttachment } from "@/hooks/useAttachmentQueries";
+import { useAppSidebar } from "@/contexts/AppSidebarContext";
+import { useSpaceContext } from "@/contexts/SpaceContext";
+import { useAttachmentLibrary, useUnusedAttachmentLibrary } from "@/hooks/useAttachmentLibrary";
+import { useBatchDeleteAttachments } from "@/hooks/useAttachmentQueries";
+import useCurrentUser from "@/hooks/useCurrentUser";
 import useDialog from "@/hooks/useDialog";
-import useLoading from "@/hooks/useLoading";
-import useMediaQuery from "@/hooks/useMediaQuery";
+import { useUsersByNames } from "@/hooks/useUserQueries";
 import i18n from "@/i18n";
+import { combineCELFilters } from "@/lib/cel-filter";
 import { handleError } from "@/lib/error";
-import type { Attachment } from "@/types/proto/api/v1/attachment_service_pb";
+import { showErrorToast, toast } from "@/lib/toast";
+import { ListAttachmentsRequestSchema } from "@/types/proto/api/attachment_service_pb";
 import { useTranslate } from "@/utils/i18n";
 
-const PAGE_SIZE = 50;
+const UNUSED_PAGE_SIZE = 1000;
+const BATCH_DELETE_SIZE = 100;
 
-const groupAttachmentsByDate = (attachments: Attachment[]): Map<string, Attachment[]> => {
-  const grouped = new Map<string, Attachment[]>();
-  const sorted = [...attachments].sort((a, b) => {
-    const aTime = a.createTime ? timestampDate(a.createTime) : undefined;
-    const bTime = b.createTime ? timestampDate(b.createTime) : undefined;
-    return dayjs(bTime).unix() - dayjs(aTime).unix();
-  });
+const chunkNames = (names: string[], size: number) => {
+  const chunks: string[][] = [];
 
-  for (const attachment of sorted) {
-    const createTime = attachment.createTime ? timestampDate(attachment.createTime) : undefined;
-    const monthKey = dayjs(createTime).format("YYYY-MM");
-    const group = grouped.get(monthKey) ?? [];
-    group.push(attachment);
-    grouped.set(monthKey, group);
+  for (let index = 0; index < names.length; index += size) {
+    chunks.push(names.slice(index, index + size));
   }
 
-  return grouped;
+  return chunks;
 };
 
-const filterAttachments = (attachments: Attachment[], searchQuery: string): Attachment[] => {
-  if (!searchQuery.trim()) return attachments;
-  const query = searchQuery.toLowerCase();
-  return attachments.filter((attachment) => attachment.filename.toLowerCase().includes(query));
+const listUnusedAttachmentNames = async (filter: string | undefined, selectedSpaceName: string | undefined) => {
+  if (selectedSpaceName) {
+    return [];
+  }
+
+  const names: string[] = [];
+  let pageToken = "";
+
+  do {
+    const response = await attachmentServiceClient.listAttachments(
+      create(ListAttachmentsRequestSchema, {
+        filter: combineCELFilters("memo_id == null", filter),
+        pageSize: UNUSED_PAGE_SIZE,
+        pageToken,
+      }),
+    );
+
+    names.push(...response.attachments.map((attachment) => attachment.name));
+    pageToken = response.nextPageToken;
+  } while (pageToken);
+
+  return names;
 };
-
-interface AttachmentItemProps {
-  attachment: Attachment;
-}
-
-const AttachmentItem = ({ attachment }: AttachmentItemProps) => (
-  <div className="w-24 sm:w-32 h-auto flex flex-col justify-start items-start">
-    <div className="w-24 h-24 flex justify-center items-center sm:w-32 sm:h-32 border border-border overflow-clip rounded-xl cursor-pointer hover:shadow hover:opacity-80">
-      <AttachmentIcon attachment={attachment} strokeWidth={0.5} />
-    </div>
-    <div className="w-full max-w-full flex flex-row justify-between items-center mt-1 px-1">
-      <p className="text-xs shrink text-muted-foreground truncate">{attachment.filename}</p>
-      {attachment.memo && (
-        <Link to={`/${attachment.memo}`} className="text-primary hover:opacity-80 transition-opacity shrink-0 ml-1" aria-label="View memo">
-          <ExternalLinkIcon className="w-3 h-3" />
-        </Link>
-      )}
-    </div>
-  </div>
-);
 
 const Attachments = () => {
   const t = useTranslate();
-  const md = useMediaQuery("md");
-  const loadingState = useLoading();
+  const currentUser = useCurrentUser();
   const deleteUnusedAttachmentsDialog = useDialog();
-  const { mutateAsync: deleteAttachment } = useDeleteAttachment();
+  const { attachmentSection, setAttachmentSection } = useAppSidebar();
+  const { memoFilter, selectedSpaceName, creatorUsername } = useSpaceContext();
+  const canShowUnused = !selectedSpaceName && (!creatorUsername || creatorUsername === currentUser?.username);
+  const [previewState, setPreviewState] = useState({ open: false, initialIndex: 0 });
+  const { mutateAsync: batchDeleteAttachments, isPending: isDeletingUnused } = useBatchDeleteAttachments();
+  const {
+    audioItems,
+    documentItems,
+    error,
+    fetchNextPage,
+    hasNextPage,
+    isError,
+    isFetching,
+    isFetchingNextPage,
+    isLoading,
+    mediaGroups,
+    mediaPreviewItems,
+    refetch,
+    stats,
+  } = useAttachmentLibrary(i18n.language, memoFilter);
+  const {
+    error: unusedError,
+    isComplete: unusedIsComplete,
+    isError: unusedIsError,
+    isLoading: unusedIsLoading,
+    refetch: refetchUnused,
+    unusedItems: completeUnusedItems,
+  } = useUnusedAttachmentLibrary(i18n.language, memoFilter, attachmentSection === "unused" && canShowUnused);
+  const creatorNames = useMemo(
+    () =>
+      Array.from(
+        new Set(
+          [
+            ...mediaGroups.flatMap((group) => group.items.map((item) => item.primaryAttachment.creator)),
+            ...documentItems.map((item) => item.attachment.creator),
+            ...audioItems.map((item) => item.attachment.creator),
+            ...completeUnusedItems.map((item) => item.attachment.creator),
+          ].filter(Boolean),
+        ),
+      ),
+    [mediaGroups, documentItems, audioItems, completeUnusedItems],
+  );
+  const { data: creators } = useUsersByNames(creatorNames);
 
-  const [searchQuery, setSearchQuery] = useState("");
-  const [attachments, setAttachments] = useState<Attachment[]>([]);
-  const [nextPageToken, setNextPageToken] = useState("");
-  const [isLoadingMore, setIsLoadingMore] = useState(false);
-
-  // Memoized computed values
-  const filteredAttachments = useMemo(() => filterAttachments(attachments, searchQuery), [attachments, searchQuery]);
-
-  const usedAttachments = useMemo(() => filteredAttachments.filter((attachment) => attachment.memo), [filteredAttachments]);
-
-  const unusedAttachments = useMemo(() => filteredAttachments.filter((attachment) => !attachment.memo), [filteredAttachments]);
-
-  const groupedAttachments = useMemo(() => groupAttachmentsByDate(usedAttachments), [usedAttachments]);
-
-  // Fetch initial attachments
   useEffect(() => {
-    const fetchInitialAttachments = async () => {
-      try {
-        const { attachments: fetchedAttachments, nextPageToken } = await attachmentServiceClient.listAttachments({
-          pageSize: PAGE_SIZE,
-        });
-        setAttachments(fetchedAttachments);
-        setNextPageToken(nextPageToken ?? "");
-      } catch (error) {
-        handleError(error, toast.error, {
-          context: "Failed to fetch attachments",
-          fallbackMessage: "Failed to load attachments. Please try again.",
-        });
-      } finally {
-        loadingState.setFinish();
+    if (!canShowUnused && attachmentSection === "unused") {
+      setAttachmentSection("all");
+    }
+  }, [attachmentSection, canShowUnused, setAttachmentSection]);
+
+  const handlePreview = (itemId: string) => {
+    const initialIndex = mediaPreviewItems.findIndex((item) => item.id === itemId);
+    setPreviewState({ open: true, initialIndex: initialIndex >= 0 ? initialIndex : 0 });
+  };
+
+  const handleDeleteUnusedAttachments = async () => {
+    try {
+      const names = await listUnusedAttachmentNames(memoFilter, selectedSpaceName);
+
+      if (names.length === 0) {
+        await Promise.all([refetch(), refetchUnused()]);
+        return;
       }
-    };
 
-    fetchInitialAttachments();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+      for (const chunk of chunkNames(names, BATCH_DELETE_SIZE)) {
+        await batchDeleteAttachments(chunk);
+      }
 
-  // Load more attachments with pagination
-  const handleLoadMore = useCallback(async () => {
-    if (!nextPageToken || isLoadingMore) return;
-
-    setIsLoadingMore(true);
-    try {
-      const { attachments: fetchedAttachments, nextPageToken: newPageToken } = await attachmentServiceClient.listAttachments({
-        pageSize: PAGE_SIZE,
-        pageToken: nextPageToken,
-      });
-      setAttachments((prev) => [...prev, ...fetchedAttachments]);
-      setNextPageToken(newPageToken ?? "");
-    } catch (error) {
-      handleError(error, toast.error, {
-        context: "Failed to load more attachments",
-        fallbackMessage: "Failed to load more attachments. Please try again.",
-      });
-    } finally {
-      setIsLoadingMore(false);
-    }
-  }, [nextPageToken, isLoadingMore]);
-
-  // Refetch all attachments from the beginning
-  const handleRefetch = useCallback(async () => {
-    try {
-      loadingState.setLoading();
-      const { attachments: fetchedAttachments, nextPageToken } = await attachmentServiceClient.listAttachments({
-        pageSize: PAGE_SIZE,
-      });
-      setAttachments(fetchedAttachments);
-      setNextPageToken(nextPageToken ?? "");
-      loadingState.setFinish();
-    } catch (error) {
-      handleError(error, toast.error, {
-        context: "Failed to refetch attachments",
-        fallbackMessage: "Failed to refresh attachments. Please try again.",
-        onError: () => loadingState.setError(),
-      });
-    }
-  }, [loadingState]);
-
-  // Delete all unused attachments
-  const handleDeleteUnusedAttachments = useCallback(async () => {
-    try {
-      let allUnusedAttachments: Attachment[] = [];
-      let nextPageToken = "";
-      do {
-        const response = await attachmentServiceClient.listAttachments({
-          pageSize: 1000,
-          pageToken: nextPageToken,
-          filter: "memo_id == null",
-        });
-        allUnusedAttachments = [...allUnusedAttachments, ...response.attachments];
-        nextPageToken = response.nextPageToken;
-      } while (nextPageToken);
-
-      await Promise.all(allUnusedAttachments.map((attachment) => deleteAttachment(attachment.name)));
-      toast.success(t("resource.delete-all-unused-success"));
-    } catch (error) {
-      handleError(error, toast.error, {
+      toast.add({ title: t("resource.delete-all-unused-success"), type: "success" });
+      await Promise.all([refetch(), refetchUnused()]);
+    } catch (deleteError) {
+      handleError(deleteError, showErrorToast, {
         context: "Failed to delete unused attachments",
         fallbackMessage: t("resource.delete-all-unused-error"),
       });
-    } finally {
-      await handleRefetch();
     }
-  }, [t, handleRefetch, deleteAttachment]);
+  };
 
-  // Handle search input change
-  const handleSearchChange = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
-    setSearchQuery(e.target.value);
-  }, []);
+  const renderContent = () => {
+    if (attachmentSection === "unused") {
+      if (unusedIsError) {
+        return (
+          <AttachmentLibraryErrorState error={unusedError instanceof Error ? unusedError : undefined} onRetry={() => refetchUnused()} />
+        );
+      }
+
+      if (unusedIsLoading || !unusedIsComplete) {
+        return <AttachmentLibrarySkeletonGrid />;
+      }
+
+      return completeUnusedItems.length === 0 ? (
+        <div className="py-12 text-center mu-body text-mu-text-secondary">{t("message.no-data")}</div>
+      ) : (
+        <div className="space-y-4">
+          <div className="flex flex-col gap-3 rounded-mu-xl border border-mu-warning/30 bg-mu-warning-soft p-4 sm:flex-row sm:items-center sm:justify-between">
+            <div>
+              <h2 className="mu-label text-mu-text">{t("attachment-library.unused.title")}</h2>
+              <p className="mt-1 mu-body text-mu-text-secondary">{t("attachment-library.unused.description")}</p>
+            </div>
+            <Button
+              variant="neutral"
+              className="shrink-0"
+              onClick={() => deleteUnusedAttachmentsDialog.open()}
+              loading={isDeletingUnused}
+              loadingLabel={t("resource.delete-all-unused")}
+              icon={<Trash2Icon />}
+            >
+              {t("resource.delete-all-unused")}
+            </Button>
+          </div>
+          <AttachmentUnusedRows items={completeUnusedItems} creators={creators} />
+        </div>
+      );
+    }
+
+    if (isLoading) {
+      return <AttachmentLibrarySkeletonGrid />;
+    }
+
+    if (isError) {
+      return <AttachmentLibraryErrorState error={error instanceof Error ? error : undefined} onRetry={() => refetch()} />;
+    }
+
+    if (attachmentSection === "all") {
+      const total = stats.media + stats.documents + stats.audio;
+      if (total === 0) return <div className="py-16 text-center mu-body text-mu-text-secondary">{t("attachment-library.empty.all")}</div>;
+      return (
+        <div className="space-y-9">
+          {stats.media > 0 && (
+            <section className="space-y-3">
+              <h2 className="mu-label text-mu-text">{t("attachment-library.tabs.media")}</h2>
+              <AttachmentMediaGrid groups={mediaGroups} creators={creators} onPreview={handlePreview} />
+            </section>
+          )}
+          {stats.documents > 0 && (
+            <section className="space-y-3">
+              <h2 className="mu-label text-mu-text">{t("attachment-library.tabs.documents")}</h2>
+              <AttachmentDocumentRows items={documentItems} creators={creators} />
+            </section>
+          )}
+          {stats.audio > 0 && (
+            <section className="space-y-3">
+              <h2 className="mu-label text-mu-text">{t("attachment-library.tabs.audio")}</h2>
+              <AttachmentAudioRows items={audioItems} creators={creators} />
+            </section>
+          )}
+        </div>
+      );
+    }
+
+    if (attachmentSection === "media") {
+      if (stats.media === 0) return <AttachmentLibraryEmptyState tab="media" />;
+      return <AttachmentMediaGrid groups={mediaGroups} creators={creators} onPreview={handlePreview} />;
+    }
+
+    if (attachmentSection === "documents") {
+      if (stats.documents === 0) return <AttachmentLibraryEmptyState tab="documents" />;
+      return <AttachmentDocumentRows items={documentItems} creators={creators} />;
+    }
+
+    if (attachmentSection === "audio") {
+      if (stats.audio === 0) return <AttachmentLibraryEmptyState tab="audio" />;
+      return <AttachmentAudioRows items={audioItems} creators={creators} />;
+    }
+
+    return null;
+  };
 
   return (
-    <section className="@container w-full max-w-5xl min-h-full flex flex-col justify-start items-center sm:pt-3 md:pt-6 pb-8">
-      {!md && <MobileHeader />}
-      <div className="w-full px-4 sm:px-6">
-        <div className="w-full border border-border flex flex-col justify-start items-start px-4 py-3 rounded-xl bg-background text-foreground">
-          <div className="relative w-full flex flex-row justify-between items-center">
-            <p className="py-1 flex flex-row justify-start items-center select-none opacity-80">
-              <PaperclipIcon className="w-6 h-auto mr-1 opacity-80" />
-              <span className="text-lg">{t("common.attachments")}</span>
-            </p>
-            <div>
-              <div className="relative max-w-32">
-                <SearchIcon className="absolute left-3 top-1/2 transform -translate-y-1/2 w-4 h-4 text-muted-foreground" />
-                <Input className="pl-9" placeholder={t("common.search")} value={searchQuery} onChange={handleSearchChange} />
-              </div>
-            </div>
-          </div>
-          <div className="w-full flex flex-col justify-start items-start mt-4 mb-6">
-            {loadingState.isLoading ? (
-              <div className="w-full h-32 flex flex-col justify-center items-center">
-                <p className="w-full text-center text-base my-6 mt-8">{t("resource.fetching-data")}</p>
-              </div>
-            ) : (
-              <>
-                {filteredAttachments.length === 0 ? (
-                  <div className="w-full mt-8 mb-8 flex flex-col justify-center items-center italic">
-                    <Empty />
-                    <p className="mt-4 text-muted-foreground">{t("message.no-data")}</p>
-                  </div>
-                ) : (
-                  <>
-                    <div className={"w-full h-auto px-2 flex flex-col justify-start items-start gap-y-8"}>
-                      {Array.from(groupedAttachments.entries()).map(([monthStr, attachments]) => {
-                        return (
-                          <div key={monthStr} className="w-full flex flex-row justify-start items-start">
-                            <div className="w-16 sm:w-24 pt-4 sm:pl-4 flex flex-col justify-start items-start">
-                              <span className="text-sm opacity-60">{dayjs(monthStr).year()}</span>
-                              <span className="font-medium text-xl">
-                                {dayjs(monthStr).toDate().toLocaleString(i18n.language, { month: "short" })}
-                              </span>
-                            </div>
-                            <div className="w-full max-w-[calc(100%-4rem)] sm:max-w-[calc(100%-6rem)] flex flex-row justify-start items-start gap-4 flex-wrap">
-                              {attachments.map((attachment) => (
-                                <AttachmentItem key={attachment.name} attachment={attachment} />
-                              ))}
-                            </div>
-                          </div>
-                        );
-                      })}
+    <section className="@container min-h-full w-full pb-10 pt-3 md:pt-6">
+      <div className="mx-auto flex w-full max-w-7xl flex-col gap-5 px-4 sm:gap-6 sm:px-6">
+        <div className="min-h-[16rem] pt-1">
+          {renderContent()}
 
-                      {unusedAttachments.length > 0 && (
-                        <>
-                          <Separator />
-                          <div className="w-full flex flex-row justify-start items-start">
-                            <div className="w-16 sm:w-24 sm:pl-4 flex flex-col justify-start items-start"></div>
-                            <div className="w-full max-w-[calc(100%-4rem)] sm:max-w-[calc(100%-6rem)] flex flex-row justify-start items-start gap-4 flex-wrap">
-                              <div className="w-full flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
-                                <div className="flex flex-row items-center gap-2">
-                                  <span className="text-muted-foreground">{t("resource.unused-resources")}</span>
-                                  <span className="text-muted-foreground opacity-80">({unusedAttachments.length})</span>
-                                </div>
-                                <div>
-                                  <Button variant="destructive" onClick={() => deleteUnusedAttachmentsDialog.open()} size="sm">
-                                    <Trash />
-                                    {t("resource.delete-all-unused")}
-                                  </Button>
-                                </div>
-                              </div>
-                              {unusedAttachments.map((attachment) => (
-                                <AttachmentItem key={attachment.name} attachment={attachment} />
-                              ))}
-                            </div>
-                          </div>
-                        </>
-                      )}
-                    </div>
-                    {nextPageToken && (
-                      <div className="w-full flex flex-row justify-center items-center mt-4">
-                        <Button variant="outline" size="sm" onClick={handleLoadMore} disabled={isLoadingMore}>
-                          {isLoadingMore ? t("resource.fetching-data") : t("memo.load-more")}
-                        </Button>
-                      </div>
-                    )}
-                  </>
-                )}
-              </>
-            )}
-          </div>
+          {attachmentSection !== "unused" && hasNextPage && (
+            <div className="mt-6 flex justify-center">
+              <Button
+                variant="neutral"
+                onClick={() => fetchNextPage()}
+                loading={isFetchingNextPage}
+                loadingLabel={t("resource.fetching-data")}
+              >
+                {isFetchingNextPage ? t("resource.fetching-data") : t("memo.load-more")}
+              </Button>
+            </div>
+          )}
+
+          {!isLoading && isFetching && !isFetchingNextPage && (
+            <div className="mt-4 text-center mu-caption text-mu-text-secondary">{t("resource.fetching-data")}</div>
+          )}
         </div>
       </div>
 
@@ -280,10 +266,18 @@ const Attachments = () => {
         open={deleteUnusedAttachmentsDialog.isOpen}
         onOpenChange={deleteUnusedAttachmentsDialog.setOpen}
         title={t("resource.delete-all-unused-confirm")}
+        description={t("attachment-library.unused.confirm-description")}
         confirmLabel={t("common.delete")}
         cancelLabel={t("common.cancel")}
         onConfirm={handleDeleteUnusedAttachments}
-        confirmVariant="destructive"
+        confirmVariant="danger"
+      />
+
+      <PreviewImageDialog
+        open={previewState.open}
+        onOpenChange={(open) => setPreviewState((prev) => ({ ...prev, open }))}
+        items={mediaPreviewItems}
+        initialIndex={previewState.initialIndex}
       />
     </section>
   );

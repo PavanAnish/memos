@@ -1,46 +1,147 @@
-import { memo, useMemo, useRef, useState } from "react";
+import { forwardRef, memo, Suspense, useCallback, useEffect, useImperativeHandle, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useLocation } from "react-router-dom";
+import { useColumnGridUntrapped } from "@/components/ColumnGrid/ColumnGridContext";
+import { useAuth } from "@/contexts/AuthContext";
+import { useResolvedUser } from "@/contexts/MentionResolutionContext";
 import useCurrentUser from "@/hooks/useCurrentUser";
-import { useUser } from "@/hooks/useUserQueries";
+import { isMemoBlurred } from "@/lib/tag";
 import { cn } from "@/lib/utils";
-import { State } from "@/types/proto/api/v1/common_pb";
-import { isSuperUser } from "@/utils/user";
-import MemoEditor from "../MemoEditor";
-import PreviewImageDialog from "../PreviewImageDialog";
-import { MemoBody, MemoHeader } from "./components";
+import { State } from "@/types/proto/api/common_pb";
+import { lazyWithReload } from "@/utils/lazy";
+import { canManageMemo } from "@/utils/user";
+import { MemoBody, MemoCommentListView, MemoHeader } from "./components";
+import MemoPinnedMark from "./components/MemoPinnedMark";
 import { MEMO_CARD_BASE_CLASSES } from "./constants";
-import { useImagePreview, useMemoActions, useMemoHandlers } from "./hooks";
-import { MemoViewContext } from "./MemoViewContext";
-import type { MemoViewProps } from "./types";
+import { useImagePreview } from "./hooks";
+import { computeCommentAmount, MemoViewContext } from "./MemoViewContext";
+import { isMemoDetailPath, resolveMemoParentPage } from "./navigation";
+import type { MemoViewHandle, MemoViewProps } from "./types";
 
-const MemoView: React.FC<MemoViewProps> = (props: MemoViewProps) => {
-  const { memo: memoData, className, parentPage: parentPageProp } = props;
+const MemoShareImageDialog = lazyWithReload(() => import("../MemoActionMenu/MemoShareImageDialog"));
+const PreviewImageDialog = lazyWithReload(() => import("../PreviewImageDialog"));
+
+const MemoView = forwardRef<MemoViewHandle, MemoViewProps>((props, ref) => {
+  const {
+    memo: memoData,
+    className,
+    parentPage: parentPageProp,
+    compact,
+    timeDisplay,
+    showCreator,
+    showVisibility,
+    showPinned,
+    showSpace,
+  } = props;
   const cardRef = useRef<HTMLDivElement>(null);
-  const [showEditor, setShowEditor] = useState(false);
+  const [isEditing, setIsEditing] = useState(false);
+  const [cardWidth, setCardWidth] = useState(0);
 
   const currentUser = useCurrentUser();
-  const creator = useUser(memoData.creator).data;
+  const { userTagsSetting } = useAuth();
+  const creator = useResolvedUser(memoData.creator, { enabled: Boolean(showCreator || props.shareImageDialogOpen) });
   const isArchived = memoData.state === State.ARCHIVED;
-  const readonly = memoData.creator !== currentUser?.name && !isSuperUser(currentUser);
-  const parentPage = parentPageProp || "/";
+  const readonly = !canManageMemo(memoData, currentUser);
+  const location = useLocation();
+  const parentPage = resolveMemoParentPage({
+    explicitParentPage: parentPageProp,
+    pathname: location.pathname,
+    search: location.search,
+    memoName: memoData.name,
+  });
 
-  // NSFW content management: always blur content tagged with NSFW (case-insensitive)
-  const [showNSFWContent, setShowNSFWContent] = useState(false);
-  const nsfw = memoData.tags?.some((tag) => tag.toUpperCase() === "NSFW") ?? false;
-  const toggleNsfwVisibility = () => setShowNSFWContent((prev) => !prev);
+  // Blur content when any tag has blur_content enabled in the current user's tag settings.
+  // The detail page controls the reveal so the sidebar outline can follow it.
+  const [localShowBlurredContent, setLocalShowBlurredContent] = useState(false);
+  const blurControlled = props.showBlurredContent !== undefined;
+  const showBlurredContent = props.showBlurredContent ?? localShowBlurredContent;
+  const onShowBlurredContentChange = props.onShowBlurredContentChange;
+  const blurred = isMemoBlurred(memoData, userTagsSetting);
+  const toggleBlurVisibility = useCallback(() => {
+    const next = !showBlurredContent;
+    if (!blurControlled) {
+      setLocalShowBlurredContent(next);
+    }
+    onShowBlurredContentChange?.(next);
+  }, [blurControlled, onShowBlurredContentChange, showBlurredContent]);
 
   const { previewState, openPreview, setPreviewOpen } = useImagePreview();
-  const { unpinMemo } = useMemoActions(memoData, isArchived);
 
-  const closeEditor = () => setShowEditor(false);
-  const openEditor = () => setShowEditor(true);
+  const focusMountedEditor = useCallback(() => {
+    const editorRoot = cardRef.current?.querySelector<HTMLElement>('.memo-editor-root[contenteditable="true"]');
+    const fallbackInput = cardRef.current?.querySelector<HTMLElement>("textarea, input");
+    (editorRoot ?? fallbackInput)?.focus();
+  }, []);
 
-  const { handleGotoMemoDetailPage, handleMemoContentClick, handleMemoContentDoubleClick } = useMemoHandlers({
-    memoName: memoData.name,
-    parentPage,
-    readonly,
-    openEditor,
-    openPreview,
-  });
+  // The body edits in place: the card, its header and its frame stay, and the memo's
+  // own editing session takes the body's place until it saves or cancels.
+  const openEditor = useCallback(() => {
+    if (isEditing) {
+      focusMountedEditor();
+      return;
+    }
+    setIsEditing(true);
+  }, [focusMountedEditor, isEditing]);
+  const closeEditor = useCallback(() => setIsEditing(false), []);
+
+  // The grid keys tiles by memo name (see getMemoKey), so the focused editor
+  // identifies its own tile by name and untraps it for the duration.
+  const { setUntrappedKey, clearUntrappedKey } = useColumnGridUntrapped();
+  const handleFocusModeChange = useCallback(
+    (isFocusMode: boolean) => {
+      if (isFocusMode) {
+        setUntrappedKey(memoData.name);
+      } else {
+        clearUntrappedKey(memoData.name);
+      }
+    },
+    [memoData.name, setUntrappedKey, clearUntrappedKey],
+  );
+  // Release the slot when the editor closes or this card unmounts. Both calls
+  // are ownership-scoped, so mounting cards never clobber another card's slot.
+  useEffect(() => {
+    if (!isEditing) {
+      clearUntrappedKey(memoData.name);
+    }
+  }, [isEditing, memoData.name, clearUntrappedKey]);
+  useEffect(() => () => clearUntrappedKey(memoData.name), [memoData.name, clearUntrappedKey]);
+
+  useImperativeHandle(ref, () => ({ openEditor }), [openEditor]);
+
+  const isInMemoDetailPage = isMemoDetailPath(location.pathname, memoData.name);
+  const showCommentPreview = !isInMemoDetailPage && computeCommentAmount(memoData) > 0;
+
+  // The card width is only needed by the share-image dialog. Keep feed cards
+  // free of a permanent ResizeObserver and measure only while that dialog is open.
+  useLayoutEffect(() => {
+    if (!props.shareImageDialogOpen) {
+      return;
+    }
+
+    const card = cardRef.current;
+    if (!card) {
+      return;
+    }
+
+    const updateWidth = (nextWidth?: number) => {
+      const width = Math.round(nextWidth ?? card.getBoundingClientRect().width);
+      setCardWidth((prev) => (prev === width ? prev : width));
+    };
+
+    updateWidth();
+
+    if (typeof ResizeObserver === "undefined") {
+      const handleResize = () => updateWidth();
+      window.addEventListener("resize", handleResize);
+      return () => window.removeEventListener("resize", handleResize);
+    }
+
+    const resizeObserver = new ResizeObserver((entries) => {
+      updateWidth(entries[0]?.contentRect.width);
+    });
+
+    resizeObserver.observe(card);
+    return () => resizeObserver.disconnect();
+  }, [props.shareImageDialogOpen]);
 
   const contextValue = useMemo(
     () => ({
@@ -48,55 +149,81 @@ const MemoView: React.FC<MemoViewProps> = (props: MemoViewProps) => {
       creator,
       currentUser,
       parentPage,
+      cardWidth,
       isArchived,
       readonly,
-      showNSFWContent,
-      nsfw,
+      showBlurredContent,
+      blurred,
+      isEditing,
+      openEditor,
+      closeEditor,
+      onEditorFocusModeChange: handleFocusModeChange,
+      toggleBlurVisibility,
+      openPreview,
     }),
-    [memoData, creator, currentUser, parentPage, isArchived, readonly, showNSFWContent, nsfw],
+    [
+      memoData,
+      creator,
+      currentUser,
+      parentPage,
+      cardWidth,
+      isArchived,
+      readonly,
+      showBlurredContent,
+      blurred,
+      isEditing,
+      openEditor,
+      closeEditor,
+      handleFocusModeChange,
+      toggleBlurVisibility,
+      openPreview,
+    ],
   );
 
-  if (showEditor) {
-    return (
-      <MemoEditor
-        autoFocus
-        className="mb-2"
-        cacheKey={`inline-memo-editor-${memoData.name}`}
-        memo={memoData}
-        onConfirm={closeEditor}
-        onCancel={closeEditor}
-      />
-    );
-  }
+  const article = (
+    <article
+      className={cn(MEMO_CARD_BASE_CLASSES, "group/memo", showCommentPreview ? "mb-0 rounded-b-none" : "mb-2", className)}
+      ref={cardRef}
+      tabIndex={readonly ? -1 : 0}
+    >
+      {/* The pinned mark steps aside while the memo is edited in place. */}
+      {showPinned && memoData.pinned && !isEditing && <MemoPinnedMark />}
+      <MemoHeader timeDisplay={timeDisplay} showCreator={showCreator} showVisibility={showVisibility} showSpace={showSpace} />
 
-  return (
-    <MemoViewContext.Provider value={contextValue}>
-      <article className={cn(MEMO_CARD_BASE_CLASSES, className)} ref={cardRef} tabIndex={readonly ? -1 : 0}>
-        <MemoHeader
-          showCreator={props.showCreator}
-          showVisibility={props.showVisibility}
-          showPinned={props.showPinned}
-          onEdit={openEditor}
-          onGotoDetail={handleGotoMemoDetailPage}
-          onUnpin={unpinMemo}
-        />
+      <MemoBody compact={compact} showCreator={showCreator} />
 
-        <MemoBody
-          compact={props.compact}
-          onContentClick={handleMemoContentClick}
-          onContentDoubleClick={handleMemoContentDoubleClick}
-          onToggleNsfwVisibility={toggleNsfwVisibility}
-        />
+      {previewState.items.length > 0 && (
+        <Suspense fallback={null}>
+          <PreviewImageDialog
+            open={previewState.open}
+            onOpenChange={setPreviewOpen}
+            items={previewState.items}
+            initialIndex={previewState.index}
+            drawingContext={{ memo: memoData, canEdit: !readonly }}
+          />
+        </Suspense>
+      )}
 
-        <PreviewImageDialog
-          open={previewState.open}
-          onOpenChange={setPreviewOpen}
-          imgUrls={previewState.urls}
-          initialIndex={previewState.index}
-        />
-      </article>
-    </MemoViewContext.Provider>
+      {props.onShareImageDialogOpenChange && props.shareImageDialogOpen && (
+        <Suspense fallback={null}>
+          <MemoShareImageDialog open onOpenChange={props.onShareImageDialogOpenChange} />
+        </Suspense>
+      )}
+    </article>
   );
-};
+
+  const memoDisplay = showCommentPreview ? (
+    <div className="w-full mb-2">
+      {article}
+      <MemoCommentListView />
+    </div>
+  ) : (
+    article
+  );
+
+  return <MemoViewContext.Provider value={contextValue}>{memoDisplay}</MemoViewContext.Provider>;
+});
+
+MemoView.displayName = "MemoView";
 
 export default memo(MemoView);

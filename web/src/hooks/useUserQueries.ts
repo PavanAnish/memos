@@ -1,9 +1,29 @@
 import { create } from "@bufbuild/protobuf";
 import { FieldMaskSchema } from "@bufbuild/protobuf/wkt";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { authServiceClient, shortcutServiceClient, userServiceClient } from "@/connect";
-import { buildUserSettingName } from "@/helpers/resource-names";
-import { User, UserSetting, UserSetting_GeneralSetting, UserSetting_Key, UserSettingSchema } from "@/types/proto/api/v1/user_service_pb";
+import { type QueryClient, queryOptions, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { userServiceClient } from "@/connect";
+import useCurrentUser from "@/hooks/useCurrentUser";
+import { buildUserSettingName, userNamePrefix } from "@/lib/resource-names";
+import { mergeTagCounts } from "@/lib/tag";
+import {
+  type ListUserStatsRequest,
+  ListUserStatsRequestSchema,
+  User,
+  UserNotification,
+  UserNotification_Status,
+  UserSetting,
+  UserSetting_EditorSetting,
+  UserSetting_GeneralSetting,
+  UserSetting_Key,
+  UserSettingSchema,
+  UserStats,
+} from "@/types/proto/api/user_service_pb";
+
+const BATCH_GET_USERS_LIMIT = 100;
+const USER_PROFILE_STALE_TIME = 1000 * 60 * 5;
+type ListUserStatsQuery = Pick<ListUserStatsRequest, "state" | "filter">;
+// ListUserStats aggregates across every user through the "users/-" wildcard parent.
+const ALL_USERS_PARENT = `${userNamePrefix}-`;
 
 // Query keys factory
 export const userKeys = {
@@ -11,65 +31,88 @@ export const userKeys = {
   details: () => [...userKeys.all, "detail"] as const,
   detail: (name: string) => [...userKeys.details(), name] as const,
   stats: () => [...userKeys.all, "stats"] as const,
-  userStats: (name: string) => [...userKeys.stats(), name] as const,
+  userStats: (name: string, filter?: string) =>
+    filter ? ([...userKeys.stats(), name, filter] as const) : ([...userKeys.stats(), name] as const),
+  allUserStats: (request: Partial<ListUserStatsQuery>) => [...userKeys.stats(), "all", request] as const,
+  // Usage sits under stats so that every change that refreshes stats (memo
+  // saves, deletes, attachment changes) refreshes usage too.
+  usage: (name: string) => [...userKeys.stats(), "usage", name] as const,
   currentUser: () => [...userKeys.all, "current"] as const,
-  shortcuts: () => [...userKeys.all, "shortcuts"] as const,
+  memoViews: (parent?: string) => [...userKeys.all, "memoViews", parent] as const,
   notifications: () => [...userKeys.all, "notifications"] as const,
-  byNames: (names: string[]) => [...userKeys.all, "byNames", ...names.sort()] as const,
+  byNames: (names: string[]) => [...userKeys.all, "byNames", ...[...names].sort()] as const,
+  byUsernames: (usernames: string[]) => [...userKeys.all, "byUsernames", ...[...usernames].sort()] as const,
 };
 
-// NOTE: This hook is currently UNUSED in favor of the AuthContext-based
-// useCurrentUser hook (src/hooks/useCurrentUser.ts). This is kept for potential
-// future migration to React Query for auth state.
-export function useCurrentUserQuery() {
-  return useQuery({
-    queryKey: userKeys.currentUser(),
-    queryFn: async () => {
-      const { user } = await authServiceClient.getCurrentUser({});
-      return user;
-    },
-    staleTime: 1000 * 60 * 5, // 5 minutes - auth doesn't change often
+export const userDetailQueryOptions = (name: string) =>
+  queryOptions({
+    queryKey: userKeys.detail(name),
+    queryFn: () => userServiceClient.getUser({ name }),
+    staleTime: USER_PROFILE_STALE_TIME,
   });
-}
 
 export function useUser(name: string, options?: { enabled?: boolean }) {
   return useQuery({
-    queryKey: userKeys.detail(name),
-    queryFn: async () => {
-      const user = await userServiceClient.getUser({ name });
-      return user;
-    },
+    ...userDetailQueryOptions(name),
     enabled: options?.enabled ?? true,
-    staleTime: 1000 * 60 * 5, // 5 minutes - user profiles don't change often
   });
 }
 
-export function useUserStats(username?: string) {
+export function useUserStats(username?: string, options?: { enabled?: boolean; filter?: string }) {
   return useQuery({
-    queryKey: username ? userKeys.userStats(username) : userKeys.stats(),
+    queryKey: username ? userKeys.userStats(username, options?.filter) : userKeys.stats(),
     queryFn: async () => {
       if (!username) {
         throw new Error("Username is required");
       }
-      const stats = await userServiceClient.getUserStats({ name: username });
+      const stats = await userServiceClient.getUserStats({ name: username, filter: options?.filter });
       return stats;
     },
-    enabled: !!username,
+    enabled: !!username && (options?.enabled ?? true),
   });
 }
 
-export function useShortcuts() {
+/** A user's memo count and stored bytes, and the usage limits in effect for the user. */
+export function useUserUsage(username?: string, options?: { enabled?: boolean }) {
   return useQuery({
-    queryKey: userKeys.shortcuts(),
+    queryKey: username ? userKeys.usage(username) : userKeys.stats(),
     queryFn: async () => {
-      const { shortcuts } = await shortcutServiceClient.listShortcuts({});
-      return shortcuts;
+      if (!username) {
+        throw new Error("Username is required");
+      }
+      return userServiceClient.getUserUsage({ name: `${username}/usage` });
     },
+    enabled: !!username && (options?.enabled ?? true),
+  });
+}
+
+export function useAllUserStats(request: Partial<ListUserStatsQuery> = {}, options?: { enabled?: boolean }) {
+  return useQuery({
+    queryKey: userKeys.allUserStats(request),
+    queryFn: async () => {
+      const { userStats } = await userServiceClient.listUserStats(
+        create(ListUserStatsRequestSchema, { ...request, parent: ALL_USERS_PARENT }),
+      );
+      return userStats;
+    },
+    enabled: options?.enabled ?? true,
+  });
+}
+
+export function useMemoViews(parent?: string) {
+  return useQuery({
+    queryKey: userKeys.memoViews(parent),
+    queryFn: async () => {
+      if (!parent) return [];
+      const { memoViews } = await userServiceClient.listMemoViews({ parent });
+      return memoViews;
+    },
+    enabled: !!parent,
   });
 }
 
 export function useNotifications() {
-  const { data: currentUser } = useCurrentUserQuery();
+  const currentUser = useCurrentUser();
 
   return useQuery({
     queryKey: userKeys.notifications(),
@@ -85,34 +128,73 @@ export function useNotifications() {
   });
 }
 
-export function useTagCounts(forCurrentUser = false) {
-  const { data: currentUser } = useCurrentUserQuery();
+const updateCachedNotifications = (queryClient: QueryClient, update: (notifications: UserNotification[]) => UserNotification[]) => {
+  const notifications = queryClient.getQueryData<UserNotification[]>(userKeys.notifications());
+  if (notifications !== undefined) {
+    queryClient.setQueryData<UserNotification[]>(userKeys.notifications(), update(notifications));
+  }
+};
 
-  return useQuery({
-    queryKey: forCurrentUser ? [...userKeys.stats(), "tagCounts", "current"] : [...userKeys.stats(), "tagCounts", "all"],
-    queryFn: async () => {
+export function useArchiveNotification() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: (name: string) =>
+      userServiceClient.updateUserNotification({
+        notification: { name, status: UserNotification_Status.ARCHIVED },
+        updateMask: create(FieldMaskSchema, { paths: ["status"] }),
+      }),
+    onSuccess: (updated) => {
+      updateCachedNotifications(queryClient, (notifications) =>
+        notifications.map((notification) => (notification.name === updated.name ? updated : notification)),
+      );
+      void queryClient.invalidateQueries({ queryKey: userKeys.notifications() });
+    },
+  });
+}
+
+export function useDeleteNotification() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: async (name: string) => {
+      await userServiceClient.deleteUserNotification({ name });
+      return name;
+    },
+    onSuccess: (name) => {
+      updateCachedNotifications(queryClient, (notifications) => notifications.filter((notification) => notification.name !== name));
+      void queryClient.invalidateQueries({ queryKey: userKeys.notifications() });
+    },
+  });
+}
+
+export function useTagCounts(forCurrentUser = false) {
+  const currentUser = useCurrentUser();
+
+  return useQuery<UserStats | Record<string, number>, Error, Record<string, number>>({
+    queryKey:
+      forCurrentUser && currentUser?.name
+        ? userKeys.userStats(currentUser.name)
+        : [...userKeys.stats(), "tagCounts", forCurrentUser ? "current" : "all"],
+    queryFn: async (): Promise<UserStats | Record<string, number>> => {
       if (forCurrentUser) {
-        // Fetch current user stats only
         if (!currentUser?.name) {
           return {};
         }
-        const stats = await userServiceClient.getUserStats({ name: currentUser.name });
-        return stats.tagCount || {};
+        return userServiceClient.getUserStats({ name: currentUser.name });
       } else {
         // Fetch all user stats
-        const { stats } = await userServiceClient.listAllUserStats({});
+        const { userStats } = await userServiceClient.listUserStats({ parent: ALL_USERS_PARENT });
 
         // Aggregate tag counts from all users
-        const tagCount: Record<string, number> = {};
-        for (const userStats of stats) {
-          if (userStats.tagCount) {
-            for (const [tag, count] of Object.entries(userStats.tagCount)) {
-              tagCount[tag] = (tagCount[tag] || 0) + count;
-            }
-          }
-        }
-        return tagCount;
+        return mergeTagCounts(...userStats.map((stats) => stats.tagCounts));
       }
+    },
+    select: (data) => {
+      if (forCurrentUser) {
+        return mergeTagCounts((data as UserStats).tagCounts);
+      }
+      return data as Record<string, number>;
     },
     enabled: !forCurrentUser || !!currentUser?.name,
     staleTime: 1000 * 60 * 2, // 2 minutes - tags don't change frequently
@@ -157,12 +239,9 @@ export function useUserSettings(parent?: string) {
   return useQuery({
     queryKey: [...userKeys.all, "settings", parent],
     queryFn: async () => {
-      if (!parent) return { settings: [], shortcuts: [] };
-      const [{ settings }, { shortcuts }] = await Promise.all([
-        userServiceClient.listUserSettings({ parent }),
-        shortcutServiceClient.listShortcuts({ parent }),
-      ]);
-      return { settings, shortcuts };
+      if (!parent) return { settings: [] };
+      const { userSettings: settings } = await userServiceClient.listUserSettings({ parent });
+      return { settings };
     },
     enabled: !!parent,
   });
@@ -175,7 +254,7 @@ export function useUpdateUserSetting() {
   return useMutation({
     mutationFn: async ({ setting, updateMask }: { setting: UserSetting; updateMask: string[] }) => {
       const updatedSetting = await userServiceClient.updateUserSetting({
-        setting,
+        userSetting: setting,
         updateMask: create(FieldMaskSchema, { paths: updateMask }),
       });
       return updatedSetting;
@@ -186,12 +265,18 @@ export function useUpdateUserSetting() {
   });
 }
 
-// Hook to list all users
+// Hook to list all users, paging through every result.
 export function useListUsers() {
   return useQuery({
     queryKey: userKeys.all,
     queryFn: async () => {
-      const { users } = await userServiceClient.listUsers({});
+      const users: User[] = [];
+      let pageToken = "";
+      do {
+        const response = await userServiceClient.listUsers({ pageToken });
+        users.push(...response.users);
+        pageToken = response.nextPageToken;
+      } while (pageToken);
       return users;
     },
   });
@@ -217,7 +302,7 @@ export function useUpdateUserGeneralSetting(currentUserName?: string) {
       });
 
       const updatedSetting = await userServiceClient.updateUserSetting({
-        setting: userSetting,
+        userSetting,
         updateMask: create(FieldMaskSchema, { paths: updateMask }),
       });
       return updatedSetting;
@@ -228,9 +313,35 @@ export function useUpdateUserGeneralSetting(currentUserName?: string) {
   });
 }
 
+// Hook to update the user's EDITOR setting
+export function useUpdateUserEditorSetting(currentUserName?: string) {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: async (editorSetting: UserSetting_EditorSetting) => {
+      if (!currentUserName) {
+        throw new Error("No current user");
+      }
+
+      const userSetting = create(UserSettingSchema, {
+        name: buildUserSettingName(currentUserName, UserSetting_Key.EDITOR),
+        value: { case: "editorSetting", value: editorSetting },
+      });
+      return await userServiceClient.updateUserSetting({
+        userSetting,
+        updateMask: create(FieldMaskSchema, { paths: ["source_mode"] }),
+      });
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: [...userKeys.all, "settings"] });
+    },
+  });
+}
+
 // Hook to fetch multiple users by names (returns Map<name, User>)
-export function useUsersByNames(names: string[]) {
-  const enabled = names.length > 0;
+export function useUsersByNames(names: string[], options?: { enabled?: boolean }) {
+  const queryClient = useQueryClient();
+  const enabled = (options?.enabled ?? true) && names.length > 0;
   const uniqueNames = Array.from(new Set(names));
 
   return useQuery({
@@ -239,7 +350,7 @@ export function useUsersByNames(names: string[]) {
       const users = await Promise.all(
         uniqueNames.map(async (name) => {
           try {
-            const user = await userServiceClient.getUser({ name });
+            const user = await queryClient.fetchQuery(userDetailQueryOptions(name));
             return { name, user };
           } catch {
             return { name, user: undefined };
@@ -254,6 +365,54 @@ export function useUsersByNames(names: string[]) {
       return userMap;
     },
     enabled,
-    staleTime: 1000 * 60 * 5, // 5 minutes - user profiles don't change often
+    staleTime: USER_PROFILE_STALE_TIME,
+  });
+}
+
+// Hook to fetch multiple users by usernames (returns Map<username, User>)
+export function useUsersByUsernames(usernames: string[], options?: { enabled?: boolean }) {
+  const queryClient = useQueryClient();
+  const enabled = (options?.enabled ?? true) && usernames.length > 0;
+  const uniqueUsernames = Array.from(new Set(usernames));
+
+  return useQuery({
+    queryKey: userKeys.byUsernames(uniqueUsernames),
+    queryFn: async () => {
+      const usersByUsername = new Map<string, User>();
+      const missingUsernames: string[] = [];
+      for (const username of uniqueUsernames) {
+        const detailKey = userKeys.detail(`${userNamePrefix}${username}`);
+        const cachedUser = queryClient.getQueryData<User>(detailKey);
+        const cachedState = queryClient.getQueryState(detailKey);
+        const cacheIsFresh = cachedState ? Date.now() - cachedState.dataUpdatedAt < USER_PROFILE_STALE_TIME : false;
+        if (cachedUser && cacheIsFresh) {
+          usersByUsername.set(username, cachedUser);
+        } else {
+          missingUsernames.push(username);
+        }
+      }
+
+      const batches = [];
+      for (let i = 0; i < missingUsernames.length; i += BATCH_GET_USERS_LIMIT) {
+        batches.push(missingUsernames.slice(i, i + BATCH_GET_USERS_LIMIT));
+      }
+
+      const responses = await Promise.all(
+        batches.map((batch) => userServiceClient.batchGetUsers({ names: batch.map((username) => `${userNamePrefix}${username}`) })),
+      );
+      const users = responses.flatMap((response) => response.users);
+      for (const user of users) {
+        usersByUsername.set(user.username, user);
+        queryClient.setQueryData(userKeys.detail(user.name), user);
+      }
+
+      const userMap = new Map<string, User | undefined>();
+      for (const username of uniqueUsernames) {
+        userMap.set(username, usersByUsername.get(username));
+      }
+      return userMap;
+    },
+    enabled,
+    staleTime: USER_PROFILE_STALE_TIME,
   });
 }

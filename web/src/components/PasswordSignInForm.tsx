@@ -1,43 +1,43 @@
 import { timestampDate } from "@bufbuild/protobuf/wkt";
-import { LoaderIcon } from "lucide-react";
+import { Code } from "@connectrpc/connect";
+import { Button } from "@usememos/ui";
 import { useState } from "react";
-import { toast } from "react-hot-toast";
 import { setAccessToken } from "@/auth-state";
-import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
+import AuthNotice from "@/components/AuthNotice";
+import ChallengeWidget, { CHALLENGE_TOKEN_HEADER } from "@/components/ChallengeWidget";
+import CredentialFields from "@/components/CredentialFields";
 import { authServiceClient } from "@/connect";
 import { useAuth } from "@/contexts/AuthContext";
-import { useInstance } from "@/contexts/InstanceContext";
 import useLoading from "@/hooks/useLoading";
 import useNavigateTo from "@/hooks/useNavigateTo";
-import { handleError } from "@/lib/error";
+import { ERROR_REASON_CHALLENGE_REQUIRED, getErrorMessage, hasConnectCode, hasErrorReason } from "@/lib/error";
+import { ROUTES } from "@/router/routes";
 import { useTranslate } from "@/utils/i18n";
 
-function PasswordSignInForm() {
+interface PasswordSignInFormProps {
+  redirectPath?: string;
+}
+
+interface SignInError {
+  message: string;
+  // The server rejected the username and password themselves, so both fields are marked.
+  credentials: boolean;
+}
+
+function PasswordSignInForm({ redirectPath }: PasswordSignInFormProps) {
   const t = useTranslate();
   const navigateTo = useNavigateTo();
-  const { profile } = useInstance();
   const { initialize } = useAuth();
   const actionBtnLoadingState = useLoading(false);
-  const [username, setUsername] = useState(profile.demo ? "demo" : "");
-  const [password, setPassword] = useState(profile.demo ? "secret" : "");
+  const [username, setUsername] = useState("");
+  const [password, setPassword] = useState("");
+  const [error, setError] = useState<SignInError>();
+  const [challengeToken, setChallengeToken] = useState<string | null>(null);
+  const [challengeResetKey, setChallengeResetKey] = useState(0);
 
-  const handleUsernameInputChanged = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const text = e.target.value as string;
-    setUsername(text);
-  };
-
-  const handlePasswordInputChanged = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const text = e.target.value as string;
-    setPassword(text);
-  };
-
-  const handleFormSubmit = (e: React.FormEvent<HTMLFormElement>) => {
+  const handleFormSubmit = async (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault();
-    handleSignInButtonClick();
-  };
 
-  const handleSignInButtonClick = async () => {
     if (username === "" || password === "") {
       return;
     }
@@ -48,66 +48,64 @@ function PasswordSignInForm() {
 
     try {
       actionBtnLoadingState.setLoading();
-      const response = await authServiceClient.signIn({
-        credentials: {
-          case: "passwordCredentials",
-          value: { username, password },
+      setError(undefined);
+      const response = await authServiceClient.signIn(
+        {
+          credentials: {
+            case: "passwordCredentials",
+            value: { username, password },
+          },
         },
-      });
+        challengeToken ? { headers: { [CHALLENGE_TOKEN_HEADER]: challengeToken } } : undefined,
+      );
       // Store access token from login response
       if (response.accessToken) {
-        setAccessToken(response.accessToken, response.accessTokenExpiresAt ? timestampDate(response.accessTokenExpiresAt) : undefined);
+        setAccessToken(response.accessToken, response.accessTokenExpireTime ? timestampDate(response.accessTokenExpireTime) : undefined);
       }
       await initialize();
-      navigateTo("/");
-    } catch (error: unknown) {
-      handleError(error, toast.error, {
-        fallbackMessage: "Failed to sign in.",
-      });
+      navigateTo(redirectPath || ROUTES.HOME, { replace: true });
+    } catch (err: unknown) {
+      console.error(err);
+      if (hasErrorReason(err, ERROR_REASON_CHALLENGE_REQUIRED)) {
+        setChallengeResetKey((key) => key + 1);
+        setError({ message: getErrorMessage(err), credentials: false });
+      } else if (hasConnectCode(err, Code.InvalidArgument)) {
+        // The server answers an unknown user and a wrong password alike, so the message names neither.
+        setError({ message: t("auth.incorrect-credentials"), credentials: true });
+      } else {
+        setError({ message: getErrorMessage(err, t("error.sign-in-failed")), credentials: false });
+      }
     }
     actionBtnLoadingState.setFinish();
   };
 
+  const clearCredentialError = () => {
+    if (error?.credentials) setError(undefined);
+  };
+
   return (
-    <form className="w-full mt-2" onSubmit={handleFormSubmit}>
-      <div className="flex flex-col justify-start items-start w-full gap-4">
-        <div className="w-full flex flex-col justify-start items-start">
-          <span className="leading-8 text-muted-foreground">{t("common.username")}</span>
-          <Input
-            className="w-full bg-background h-10"
-            type="text"
-            readOnly={actionBtnLoadingState.isLoading}
-            placeholder={t("common.username")}
-            value={username}
-            autoComplete="username"
-            autoCapitalize="off"
-            spellCheck={false}
-            onChange={handleUsernameInputChanged}
-            required
-          />
-        </div>
-        <div className="w-full flex flex-col justify-start items-start">
-          <span className="leading-8 text-muted-foreground">{t("common.password")}</span>
-          <Input
-            className="w-full bg-background h-10"
-            type="password"
-            readOnly={actionBtnLoadingState.isLoading}
-            placeholder={t("common.password")}
-            value={password}
-            autoComplete="current-password"
-            autoCapitalize="off"
-            spellCheck={false}
-            onChange={handlePasswordInputChanged}
-            required
-          />
-        </div>
-      </div>
-      <div className="flex flex-row justify-end items-center w-full mt-6">
-        <Button type="submit" className="w-full h-10" disabled={actionBtnLoadingState.isLoading} onClick={handleSignInButtonClick}>
-          {t("common.sign-in")}
-          {actionBtnLoadingState.isLoading && <LoaderIcon className="w-5 h-auto ml-2 animate-spin opacity-60" />}
-        </Button>
-      </div>
+    <form className="flex w-full flex-col gap-4" onSubmit={handleFormSubmit}>
+      <CredentialFields
+        idPrefix="signin"
+        username={username}
+        password={password}
+        passwordAutoComplete="current-password"
+        readOnly={actionBtnLoadingState.isLoading}
+        invalid={error?.credentials ?? false}
+        onUsernameChange={(value) => {
+          setUsername(value);
+          clearCredentialError();
+        }}
+        onPasswordChange={(value) => {
+          setPassword(value);
+          clearCredentialError();
+        }}
+      />
+      <ChallengeWidget onToken={setChallengeToken} resetKey={challengeResetKey} />
+      {error && <AuthNotice tone="error">{error.message}</AuthNotice>}
+      <Button variant="primary" type="submit" loading={actionBtnLoadingState.isLoading} loadingLabel={t("auth.signing-in")}>
+        {t("common.sign-in")}
+      </Button>
     </form>
   );
 }

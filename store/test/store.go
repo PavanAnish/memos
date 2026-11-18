@@ -21,7 +21,7 @@ import (
 // NewTestingStore creates a new testing store with a fresh database.
 // Each test gets its own isolated database:
 //   - SQLite: new temp file per test
-//   - MySQL/PostgreSQL: new database per test in shared container
+//   - MySQL/MariaDB/PostgreSQL: new database per test in shared container
 func NewTestingStore(ctx context.Context, t *testing.T) *store.Store {
 	driver := getDriverFromEnv()
 	profile := getTestingProfileForDriver(t, driver)
@@ -56,6 +56,22 @@ func NewTestingStoreWithDSN(_ context.Context, t *testing.T, driver, dsn string)
 	// Do not run Migrate() automatically, as we might be testing pre-migration state
 	// or want to run it manually.
 	return store
+}
+
+// createSpaceMemberForTest keeps fixtures concise while exercising the same
+// invitation and acceptance flow used by production code.
+func createSpaceMemberForTest(ctx context.Context, testStore *store.Store, create *store.SpaceMember, actorUserID int32) (*store.SpaceMember, error) {
+	if _, err := testStore.CreateSpaceInvitation(ctx, &store.SpaceInvitation{
+		SpaceID: create.SpaceID,
+		UserID:  create.UserID,
+		Role:    create.Role,
+	}, actorUserID); err != nil {
+		return nil, err
+	}
+	return testStore.AcceptSpaceInvitation(ctx, &store.AcceptSpaceInvitation{
+		SpaceID: create.SpaceID,
+		UserID:  create.UserID,
+	}, create.UserID)
 }
 
 func getUnusedPort() int {

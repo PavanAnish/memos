@@ -1,37 +1,67 @@
 import { useQueryClient } from "@tanstack/react-query";
 import copy from "copy-to-clipboard";
 import { useCallback } from "react";
-import toast from "react-hot-toast";
 import { useLocation } from "react-router-dom";
 import { useInstance } from "@/contexts/InstanceContext";
-import { useDeleteMemo, useUpdateMemo } from "@/hooks/useMemoQueries";
+import { memoKeys, useDeleteMemo, useUpdateMemo } from "@/hooks/useMemoQueries";
 import useNavigateTo from "@/hooks/useNavigateTo";
 import { userKeys } from "@/hooks/useUserQueries";
 import { handleError } from "@/lib/error";
-import { State } from "@/types/proto/api/v1/common_pb";
-import type { Memo } from "@/types/proto/api/v1/memo_service_pb";
+import { extractMemoIdFromName } from "@/lib/resource-names";
+import { showErrorToast, toast } from "@/lib/toast";
+import { ROUTES } from "@/router/routes";
+import { State } from "@/types/proto/api/common_pb";
+import type { Memo } from "@/types/proto/api/memo_service_pb";
 import { useTranslate } from "@/utils/i18n";
+import { checkAllTasks, uncheckAllTasks } from "@/utils/markdown-task-actions";
+import { isMemoDetailPath } from "../MemoView/navigation";
 
 interface UseMemoActionHandlersOptions {
   memo: Memo;
+  parentPage?: string;
   onEdit?: () => void;
   setDeleteDialogOpen: (open: boolean) => void;
 }
 
-export const useMemoActionHandlers = ({ memo, onEdit, setDeleteDialogOpen }: UseMemoActionHandlersOptions) => {
+export const useMemoActionHandlers = ({ memo, parentPage, onEdit, setDeleteDialogOpen }: UseMemoActionHandlersOptions) => {
   const t = useTranslate();
   const location = useLocation();
   const navigateTo = useNavigateTo();
   const queryClient = useQueryClient();
   const { profile } = useInstance();
-  const { mutateAsync: updateMemo } = useUpdateMemo();
+  const { mutateAsync: updateMemo } = useUpdateMemo(memo.name);
   const { mutateAsync: deleteMemo } = useDeleteMemo();
-  const isInMemoDetailPage = location.pathname.startsWith(`/${memo.name}`);
+  const isInMemoDetailPage = isMemoDetailPath(location.pathname, memo.name);
 
   const memoUpdatedCallback = useCallback(() => {
     // Invalidate user stats to trigger refetch
     queryClient.invalidateQueries({ queryKey: userKeys.stats() });
   }, [queryClient]);
+
+  const updateMemoContent = useCallback(
+    async (nextContent: string, context: string) => {
+      if (nextContent === memo.content) {
+        return;
+      }
+
+      try {
+        await updateMemo({
+          update: {
+            name: memo.name,
+            content: nextContent,
+          },
+          updateMask: ["content", "update_time"],
+        });
+        toast.add({ title: t("memo.task-actions.updated"), type: "success" });
+      } catch (error: unknown) {
+        handleError(error, showErrorToast, {
+          context,
+          fallbackMessage: t("common.error-occurred"),
+        });
+      }
+    },
+    [memo.content, memo.name, t, updateMemo],
+  );
 
   const handleTogglePinMemoBtnClick = useCallback(async () => {
     try {
@@ -64,17 +94,17 @@ export const useMemoActionHandlers = ({ memo, onEdit, setDeleteDialogOpen }: Use
         },
         updateMask: ["state"],
       });
-      toast.success(message);
+      toast.add({ title: message, type: "success" });
     } catch (error: unknown) {
-      handleError(error, toast.error, {
+      handleError(error, showErrorToast, {
         context: `${isArchiving ? "Archive" : "Restore"} memo`,
-        fallbackMessage: "An error occurred",
+        fallbackMessage: t("common.error-occurred"),
       });
       return;
     }
 
     if (isInMemoDetailPage) {
-      navigateTo(memo.state === State.ARCHIVED ? "/" : "/archived");
+      navigateTo(memo.state === State.ARCHIVED ? ROUTES.HOME : ROUTES.ARCHIVED);
     }
     memoUpdatedCallback();
   }, [memo.name, memo.state, t, isInMemoDetailPage, navigateTo, memoUpdatedCallback, updateMemo]);
@@ -84,34 +114,56 @@ export const useMemoActionHandlers = ({ memo, onEdit, setDeleteDialogOpen }: Use
     if (host === "") {
       host = window.location.origin;
     }
-    copy(`${host}/${memo.name}`);
-    toast.success(t("message.succeed-copy-link"));
-  }, [memo.name, t, profile.instanceUrl]);
+    // A comment's link lands on the comment inside its parent memo, as the comment previews do.
+    const path = memo.parent ? `${memo.parent}#${extractMemoIdFromName(memo.name)}` : memo.name;
+    copy(`${host}/${path}`);
+    toast.add({ title: t("message.succeed-copy-link"), type: "success" });
+  }, [memo.name, memo.parent, t, profile.instanceUrl]);
 
   const handleCopyContent = useCallback(() => {
     copy(memo.content);
-    toast.success(t("message.succeed-copy-content"));
+    toast.add({ title: t("message.succeed-copy-content"), type: "success" });
   }, [memo.content, t]);
+
+  const handleCheckAllTaskListItemsClick = useCallback(async () => {
+    await updateMemoContent(checkAllTasks(memo.content), "Check memo task list items");
+  }, [memo.content, updateMemoContent]);
+
+  const handleUncheckAllTaskListItemsClick = useCallback(async () => {
+    await updateMemoContent(uncheckAllTasks(memo.content), "Uncheck memo task list items");
+  }, [memo.content, updateMemoContent]);
 
   const handleDeleteMemoClick = useCallback(() => {
     setDeleteDialogOpen(true);
   }, [setDeleteDialogOpen]);
 
   const confirmDeleteMemo = useCallback(async () => {
-    await deleteMemo(memo.name);
-    toast.success(t("message.deleted-successfully"));
+    try {
+      await deleteMemo(memo.name);
+    } catch (error: unknown) {
+      handleError(error, showErrorToast, { context: "Delete memo", fallbackMessage: t("common.error-occurred") });
+      return;
+    }
+    toast.add({ title: t("message.deleted-successfully"), type: "success" });
+    if (memo.parent) {
+      queryClient.invalidateQueries({ queryKey: memoKeys.comments(memo.parent) });
+      queryClient.invalidateQueries({ queryKey: memoKeys.detail(memo.parent) });
+    }
     if (isInMemoDetailPage) {
-      navigateTo("/");
+      navigateTo(parentPage || ROUTES.HOME);
     }
     memoUpdatedCallback();
-  }, [memo.name, t, isInMemoDetailPage, navigateTo, memoUpdatedCallback, deleteMemo]);
+  }, [memo.name, memo.parent, t, isInMemoDetailPage, parentPage, navigateTo, memoUpdatedCallback, deleteMemo, queryClient]);
 
   return {
+    isInMemoDetailPage,
     handleTogglePinMemoBtnClick,
     handleEditMemoClick,
     handleToggleMemoStatusClick,
     handleCopyLink,
     handleCopyContent,
+    handleCheckAllTaskListItemsClick,
+    handleUncheckAllTaskListItemsClick,
     handleDeleteMemoClick,
     confirmDeleteMemo,
   };

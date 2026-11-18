@@ -10,6 +10,10 @@ import (
 )
 
 func TestMain(m *testing.M) {
+	if _, err := getMySQLVariant(); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
 	// If DRIVER is set, run tests for that driver only
 	if os.Getenv("DRIVER") != "" {
 		defer TerminateContainers()
@@ -17,27 +21,37 @@ func TestMain(m *testing.M) {
 		return
 	}
 
-	// No DRIVER set - run tests for all drivers sequentially
+	// No DRIVER set - run tests for all database targets sequentially
 	runAllDrivers()
 }
 
 func runAllDrivers() {
-	drivers := []string{"sqlite", "mysql", "postgres"}
+	// Each run names a driver and the extra environment it needs.
+	runs := []struct {
+		label string
+		env   []string
+	}{
+		{"sqlite", []string{"DRIVER=sqlite", "MYSQL_VARIANT="}},
+		{"mysql", []string{"DRIVER=mysql", "MYSQL_VARIANT=mysql"}},
+		{"mariadb", []string{"DRIVER=mysql", "MYSQL_VARIANT=mariadb"}},
+		{"postgres", []string{"DRIVER=postgres", "MYSQL_VARIANT="}},
+	}
 	_, currentFile, _, _ := runtime.Caller(0)
 	projectRoot := filepath.Dir(filepath.Dir(filepath.Dir(currentFile)))
 
 	var failed []string
-	for _, driver := range drivers {
-		fmt.Printf("\n==================== %s ====================\n\n", driver)
+	for _, run := range runs {
+		fmt.Printf("\n==================== %s ====================\n\n", run.label)
 
 		cmd := exec.Command("go", "test", "-v", "-count=1", "./store/test/...")
 		cmd.Dir = projectRoot
-		cmd.Env = append(os.Environ(), "DRIVER="+driver)
+		env := append(os.Environ(), run.env...)
+		cmd.Env = env
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
 
 		if err := cmd.Run(); err != nil {
-			failed = append(failed, driver)
+			failed = append(failed, run.label)
 		}
 	}
 

@@ -5,7 +5,10 @@ package sqlite
 
 import (
 	"database/sql/driver"
+	"errors"
+	"regexp"
 	"sync"
+	"sync/atomic"
 
 	"golang.org/x/text/cases"
 	msqlite "modernc.org/sqlite"
@@ -41,4 +44,76 @@ func ensureUnicodeLowerRegistered() error {
 		})
 	})
 	return registerUnicodeLowerErr
+}
+
+var (
+	registerRegexpOnce sync.Once
+	registerRegexpErr  error
+	// regexpCache memoizes compiled patterns; keys are pattern strings.
+	regexpCache sync.Map
+	// regexpCacheSize counts cached patterns so a stream of distinct
+	// attacker-chosen patterns cannot grow the cache without bound.
+	regexpCacheSize atomic.Int64
+)
+
+// maxRegexpCacheEntries caps the compiled-pattern cache. When it is full the
+// cache is cleared rather than evicted entry by entry; recompiling a pattern
+// is cheap next to letting the cache grow unbounded.
+const maxRegexpCacheEntries = 256
+
+// ensureRegexpRegistered registers a Go-backed `regexp(pattern, value)` scalar
+// function so SQLite's `value REGEXP pattern` operator works (modernc.org/sqlite
+// has no built-in implementation). Patterns use Go's RE2 syntax. Registered once
+// globally; safe to call multiple times.
+func ensureRegexpRegistered() error {
+	registerRegexpOnce.Do(func() {
+		registerRegexpErr = msqlite.RegisterScalarFunction("regexp", 2, func(_ *msqlite.FunctionContext, args []driver.Value) (driver.Value, error) {
+			if len(args) != 2 || args[0] == nil || args[1] == nil {
+				return int64(0), nil
+			}
+			pattern, ok := args[0].(string)
+			if !ok {
+				return nil, errors.New("regexp pattern must be a string")
+			}
+			var value string
+			switch v := args[1].(type) {
+			case string:
+				value = v
+			case []byte:
+				value = string(v)
+			default:
+				return int64(0), nil
+			}
+			re, err := compileRegexp(pattern)
+			if err != nil {
+				return nil, err
+			}
+			if re.MatchString(value) {
+				return int64(1), nil
+			}
+			return int64(0), nil
+		})
+	})
+	return registerRegexpErr
+}
+
+// compileRegexp compiles and caches a RE2 pattern.
+func compileRegexp(pattern string) (*regexp.Regexp, error) {
+	if cached, ok := regexpCache.Load(pattern); ok {
+		if re, ok := cached.(*regexp.Regexp); ok {
+			return re, nil
+		}
+	}
+	re, err := regexp.Compile(pattern)
+	if err != nil {
+		return nil, err
+	}
+	if regexpCacheSize.Load() >= maxRegexpCacheEntries {
+		regexpCache.Clear()
+		regexpCacheSize.Store(0)
+	}
+	if _, loaded := regexpCache.LoadOrStore(pattern, re); !loaded {
+		regexpCacheSize.Add(1)
+	}
+	return re, nil
 }

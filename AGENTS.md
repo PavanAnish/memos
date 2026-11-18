@@ -1,572 +1,186 @@
-# Memos Codebase Guide for AI Agents
+# AGENTS.md
 
-This document provides comprehensive guidance for AI agents working with the Memos codebase. It covers architecture, workflows, conventions, and key patterns.
+Repository instructions for AI coding agents. Keep this file short, concrete, and tied to commands that actually work in this
+repo. If a fact here conflicts with source files or CI config, trust the source file and update this guide.
 
-## Project Overview
+## Project Snapshot
 
-Memos is a self-hosted knowledge management platform built with:
-- **Backend:** Go 1.25 with gRPC + Connect RPC
-- **Frontend:** React 18.3 + TypeScript + Vite 7
-- **Databases:** SQLite (default), MySQL, PostgreSQL
-- **Protocol:** Protocol Buffers (v2) with buf for code generation
-- **API Layer:** Dual protocol - Connect RPC (browsers) + gRPC-Gateway (REST)
+Memos is a self-hosted note-taking app.
 
-## Architecture
+- Backend: Go 1.27.4, net/http, Connect RPC, gRPC-Gateway, Protocol Buffers.
+- Frontend: React 19, TypeScript 7, Vite 8, Tailwind CSS v4, `@usememos/ui` on Base UI, React Query v5.
+- Storage: SQLite, MySQL, PostgreSQL; MariaDB 11.4.13 compatibility is tested through the MySQL driver.
+- Generated API outputs: `proto/gen/` for Go/OpenAPI, `web/src/types/proto/` for TypeScript.
 
-### Backend Architecture
+## Working Rules
 
-```
-cmd/memos/              # Entry point
-└── main.go             # Cobra CLI, profile setup, server initialization
+- Read relevant code before editing; prefer local patterns over new abstractions.
+- Keep diffs scoped. Do not do repo-wide cleanup, dependency churn, or generated-file rewrites unless the task requires it.
+- Do not hand-edit generated proto outputs. Change `.proto` files, then run `buf generate`.
+- Add migrations for all database drivers when schema changes, and update each driver's `LATEST.sql`.
+- Add public API endpoints to `server/api/acl_config.go`.
+- Ask before adding heavy dependencies, changing auth/token behavior, or altering Docker/release workflows.
 
-server/
-├── server.go           # Echo HTTP server, healthz, background runners
-├── auth/               # Authentication (JWT, PAT, session)
-├── router/
-│   ├── api/v1/        # gRPC service implementations
-│   │   ├── v1.go      # Service registration, gateway & Connect setup
-│   │   ├── acl_config.go   # Public endpoints whitelist
-│   │   ├── connect_services.go  # Connect RPC handlers
-│   │   ├── connect_interceptors.go # Auth, logging, recovery
-│   │   └── *_service.go    # Individual services (memo, user, etc.)
-│   ├── frontend/       # Static file serving (SPA)
-│   ├── fileserver/     # Native HTTP file serving for media
-│   └── rss/           # RSS feed generation
-└── runner/
-    ├── memopayload/    # Memo payload processing (tags, links, tasks)
-    └── s3presign/     # S3 presigned URL management
+## Documentation
 
-store/                  # Data layer with caching
-├── driver.go           # Driver interface (database operations)
-├── store.go           # Store wrapper with cache layer
-├── cache.go           # In-memory caching (instance settings, users)
-├── migrator.go        # Database migrations
-├── db/
-│   ├── db.go          # Driver factory
-│   ├── sqlite/        # SQLite implementation
-│   ├── mysql/         # MySQL implementation
-│   └── postgres/      # PostgreSQL implementation
-└── migration/         # SQL migration files (embedded)
+- ADRs and their companion glossary have been retired. Do not recreate them unless explicitly requested.
+- Design documents in `docs/design/` stay editable until the feature ships in a tagged release; keep a merged-but-unreleased design in step
+  with its implementation. After release the body is frozen: record later design changes in a dated `## Amendments` section at the end, never by
+  rewriting the body. See `docs/design/README.md`. Verify current behavior in source code and tests, not in design documents.
+- Brand copy (tagline, descriptions, README intro) comes verbatim from [`BRAND.md`](https://github.com/usememos/.github/blob/main/BRAND.md) in `usememos/.github`. Change it there first; do not keep brand guidelines in this repo.
+- Keep contributor guidance in this file and package-local `README.md` or `doc.go` files current when relevant code changes.
 
-proto/                  # Protocol Buffer definitions
-├── api/v1/           # API v1 service definitions
-└── gen/               # Generated Go & TypeScript code
-```
+## Commands
 
-### Frontend Architecture
-
-```
-web/
-├── src/
-│   ├── components/     # React components
-│   ├── contexts/       # React Context (client state)
-│   │   ├── AuthContext.tsx      # Current user, auth state
-│   │   ├── ViewContext.tsx      # Layout, sort order
-│   │   └── MemoFilterContext.tsx # Filters, shortcuts
-│   ├── hooks/          # React Query hooks (server state)
-│   │   ├── useMemoQueries.ts    # Memo CRUD, pagination
-│   │   ├── useUserQueries.ts    # User operations
-│   │   ├── useAttachmentQueries.ts # Attachment operations
-│   │   └── ...
-│   ├── lib/            # Utilities
-│   │   ├── query-client.ts  # React Query v5 client
-│   │   └── connect.ts       # Connect RPC client setup
-│   ├── pages/          # Page components
-│   └── types/proto/    # Generated TypeScript from .proto
-├── package.json        # Dependencies
-└── vite.config.mts     # Vite config with dev proxy
-
-plugin/                 # Backend plugins
-├── scheduler/         # Cron jobs
-├── email/            # Email delivery
-├── filter/           # CEL filter expressions
-├── webhook/          # Webhook dispatch
-├── markdown/         # Markdown parsing & rendering
-├── httpgetter/        # HTTP fetching (metadata, images)
-└── storage/s3/       # S3 storage backend
-```
-
-## Key Architectural Patterns
-
-### 1. API Layer: Dual Protocol
-
-**Connect RPC (Browser Clients):**
-- Protocol: `connectrpc.com/connect`
-- Base path: `/memos.api.v1.*`
-- Interceptor chain: Metadata → Logging → Recovery → Auth
-- Returns type-safe responses to React frontend
-- See: `server/router/api/v1/connect_interceptors.go:177-227`
-
-**gRPC-Gateway (REST API):**
-- Protocol: Standard HTTP/JSON
-- Base path: `/api/v1/*`
-- Uses same service implementations as Connect
-- Useful for external tools, CLI clients
-- See: `server/router/api/v1/v1.go:52-96`
-
-**Authentication:**
-- JWT Access Tokens (V2): Stateless, 15-min expiration, verified via `AuthenticateByAccessTokenV2`
-- Personal Access Tokens (PAT): Stateful, long-lived, validated against database
-- Both use `Authorization: Bearer <token>` header
-- See: `server/auth/authenticator.go:17-166`
-
-### 2. Store Layer: Interface Pattern
-
-All database operations go through the `Driver` interface:
-```go
-type Driver interface {
-    GetDB() *sql.DB
-    Close() error
-
-    IsInitialized(ctx context.Context) (bool, error)
-
-    CreateMemo(ctx context.Context, create *Memo) (*Memo, error)
-    ListMemos(ctx context.Context, find *FindMemo) ([]*Memo, error)
-    UpdateMemo(ctx context.Context, update *UpdateMemo) error
-    DeleteMemo(ctx context.Context, delete *DeleteMemo) error
-
-    // ... similar methods for all resources
-}
-```
-
-**Three Implementations:**
-- `store/db/sqlite/` - SQLite (modernc.org/sqlite)
-- `store/db/mysql/` - MySQL (go-sql-driver/mysql)
-- `store/db/postgres/` - PostgreSQL (lib/pq)
-
-**Caching Strategy:**
-- Store wrapper maintains in-memory caches for:
-  - Instance settings (`instanceSettingCache`)
-  - Users (`userCache`)
-  - User settings (`userSettingCache`)
-- Config: Default TTL 10 min, cleanup interval 5 min, max 1000 items
-- See: `store/store.go:10-57`
-
-### 3. Frontend State Management
-
-**React Query v5 (Server State):**
-- All API calls go through custom hooks in `web/src/hooks/`
-- Query keys organized by resource: `memoKeys`, `userKeys`, `attachmentKeys`
-- Default staleTime: 30s, gcTime: 5min
-- Automatic refetch on window focus, reconnect
-- See: `web/src/lib/query-client.ts`
-
-**React Context (Client State):**
-- `AuthContext`: Current user, auth initialization, logout
-- `ViewContext`: Layout mode (LIST/MASONRY), sort order
-- `MemoFilterContext`: Active filters, shortcut selection, URL sync
-
-### 4. Database Migration System
-
-**Migration Flow:**
-1. `preMigrate`: Check if DB exists. If not, apply `LATEST.sql`
-2. `checkMinimumUpgradeVersion`: Reject pre-0.22 installations
-3. `applyMigrations`: Apply incremental migrations in single transaction
-4. Demo mode: Seed with demo data
-
-**Schema Versioning:**
-- Stored in `system_setting` table
-- Format: `major.minor.patch`
-- Migration files: `store/migration/{driver}/{version}/NN__description.sql`
-- See: `store/migrator.go:21-414`
-
-### 5. Protocol Buffer Code Generation
-
-**Definition Location:** `proto/api/v1/*.proto`
-
-**Regeneration:**
-```bash
-cd proto && buf generate
-```
-
-**Generated Outputs:**
-- Go: `proto/gen/api/v1/` (used by backend services)
-- TypeScript: `web/src/types/proto/api/v1/` (used by frontend)
-
-**Linting:** `proto/buf.yaml` - BASIC lint rules, FILE breaking changes
-
-## Development Commands
-
-### Backend
+Run from the repository root unless a command starts with `cd`.
 
 ```bash
-# Start dev server
-go run ./cmd/memos --port 8081
+# Backend
+go run -buildvcs=true ./cmd/memos --port 8081 # Start backend with commit-derived CalVer
+go run -buildvcs=true ./cmd/memos config plan --data DIR --config-dir DIR # Declarative configuration: also validate, apply, state
+go test ./...                      # Run all Go tests
+go test -v ./store/...             # Store tests, including DB drivers via TestContainers
+DRIVER=mysql MYSQL_VARIANT=mariadb go test -v ./store/test/... # MariaDB compatibility tests
+go test -v -race ./server/...      # Server tests with race detector
+go test -v -race ./internal/...    # Internal package tests with race detector
+go test -v -run TestFoo ./core/... # Run matching Go tests in one tree
+go mod tidy -go=1.27.4             # Match CI tidy check
+go fix ./...                      # Apply Go modernization fixes
+go fix -diff ./...                 # Match CI modernization check
+golangci-lint run                  # Go lint, config: .golangci.yaml (includes depguard layering rules)
+golangci-lint run --fix            # Auto-fix lint, including goimports
 
-# Run all tests
-go test ./...
+# Frontend
+cd web && pnpm install             # Install dependencies
+cd web && pnpm dev                 # Dev server on :3001, proxying API to :8081 (or $DEV_PROXY_SERVER)
+cd web && pnpm lint                # Type check + Biome lint
+cd web && pnpm test                # Vitest unit tests
+cd web && pnpm build               # Production build
+cd web && pnpm release             # Build SPA into server/frontend/dist
 
-# Run tests for specific package
-go test ./store/...
-go test ./server/router/api/v1/test/...
-
-# Lint (golangci-lint)
-golangci-lint run
-
-# Format imports
-goimports -w .
-
-# Run with MySQL/Postgres
-DRIVER=mysql go run ./cmd/memos
-DRIVER=postgres go run ./cmd/memos
+# Protocol Buffers
+cd proto && buf generate           # Regenerate Go + TypeScript + OpenAPI
+cd proto && buf lint               # Lint proto files
+cd proto && buf format -w          # Format proto files
 ```
 
-### Frontend
-
-```bash
-# Install dependencies
-cd web && pnpm install
-
-# Start dev server (proxies API to localhost:8081)
-pnpm dev
-
-# Type checking
-pnpm lint
-
-# Auto-fix lint issues
-pnpm lint:fix
-
-# Format code
-pnpm format
-
-# Build for production
-pnpm build
-
-# Build and copy to backend
-pnpm release
-```
-
-### Protocol Buffers
-
-```bash
-# Regenerate Go and TypeScript from .proto files
-cd proto && buf generate
-
-# Lint proto files
-cd proto && buf lint
-
-# Check for breaking changes
-cd proto && buf breaking --against .git#main
-```
-
-## Key Workflows
-
-### Adding a New API Endpoint
-
-1. **Define in Protocol Buffer:**
-   - Edit `proto/api/v1/*_service.proto`
-   - Add request/response messages
-   - Add RPC method to service
-
-2. **Regenerate Code:**
-   ```bash
-   cd proto && buf generate
-   ```
-
-3. **Implement Service (Backend):**
-   - Add method to `server/router/api/v1/*_service.go`
-   - Follow existing patterns: fetch user, validate, call store
-   - Add Connect wrapper to `server/router/api/v1/connect_services.go` (optional, same implementation)
-
-4. **If Public Endpoint:**
-   - Add to `server/router/api/v1/acl_config.go:11-34`
-
-5. **Create Frontend Hook (if needed):**
-   - Add query/mutation to `web/src/hooks/use*Queries.ts`
-   - Use existing query key factories
-
-### Database Schema Changes
-
-1. **Create Migration Files:**
-   ```
-   store/migration/sqlite/0.28/1__add_new_column.sql
-   store/migration/mysql/0.28/1__add_new_column.sql
-   store/migration/postgres/0.28/1__add_new_column.sql
-   ```
-
-2. **Update LATEST.sql:**
-   - Add change to `store/migration/{driver}/LATEST.sql`
-
-3. **Update Store Interface (if new table/model):**
-   - Add methods to `store/driver.go:8-71`
-   - Implement in `store/db/{driver}/*.go`
-
-4. **Test Migration:**
-   - Run `go test ./store/test/...` to verify
-
-### Adding a New Frontend Page
-
-1. **Create Page Component:**
-   - Add to `web/src/pages/NewPage.tsx`
-   - Use existing hooks for data fetching
-
-2. **Add Route:**
-   - Edit `web/src/App.tsx` (or router configuration)
-
-3. **Use React Query:**
-   ```typescript
-   import { useMemos } from "@/hooks/useMemoQueries";
-   const { data, isLoading } = useMemos({ filter: "..." });
-   ```
-
-4. **Use Context for Client State:**
-   ```typescript
-   import { useView } from "@/contexts/ViewContext";
-   const { layout, toggleSortOrder } = useView();
-   ```
-
-## Testing
-
-### Backend Tests
-
-**Test Pattern:**
-```go
-func TestMemoCreation(t *testing.T) {
-    ctx := context.Background()
-    store := test.NewTestingStore(ctx, t)
-
-    // Create test user
-    user, _ := createTestUser(ctx, store, t)
-
-    // Execute operation
-    memo, err := store.CreateMemo(ctx, &store.Memo{
-        CreatorID: user.ID,
-        Content:  "Test memo",
-        // ...
-    })
-    require.NoError(t, err)
-    assert.NotNil(t, memo)
-}
-```
-
-**Test Utilities:**
-- `store/test/store.go:22-35` - `NewTestingStore()` creates isolated DB
-- `store/test/store.go:37-77` - `resetTestingDB()` cleans tables
-- Test DB determined by `DRIVER` env var (default: sqlite)
-
-**Running Tests:**
-```bash
-# All tests
-go test ./...
-
-# Specific package
-go test ./store/...
-go test ./server/router/api/v1/test/...
-
-# With coverage
-go test -cover ./...
-```
-
-### Frontend Testing
-
-**TypeScript Checking:**
-```bash
-cd web && pnpm lint
-```
-
-**No Automated Tests:**
-- Frontend relies on TypeScript checking and manual validation
-- React Query DevTools available in dev mode (bottom-left)
-
-## Code Conventions
-
-### Go
-
-**Error Handling:**
-- Use `github.com/pkg/errors` for wrapping: `errors.Wrap(err, "context")`
-- Return structured gRPC errors: `status.Errorf(codes.NotFound, "message")`
-
-**Naming:**
-- Package names: lowercase, single word (e.g., `store`, `server`)
-- Interfaces: `Driver`, `Store`, `Service`
-- Methods: PascalCase for exported, camelCase for internal
-
-**Comments:**
-- Public exported functions must have comments (godot enforces)
-- Use `//` for single-line, `/* */` for multi-line
-
-**Imports:**
-- Grouped: stdlib, third-party, local
-- Sorted alphabetically within groups
-- Use `goimports -w .` to format
-
-### TypeScript/React
-
-**Components:**
-- Functional components with hooks
-- Use `useMemo`, `useCallback` for optimization
-- Props interfaces: `interface Props { ... }`
-
-**State Management:**
-- Server state: React Query hooks
-- Client state: React Context
-- Avoid direct useState for server data
-
-**Styling:**
-- Tailwind CSS v4 via `@tailwindcss/vite`
-- Use `clsx` and `tailwind-merge` for conditional classes
-
-**Imports:**
-- Absolute imports with `@/` alias
-- Group: React, third-party, local
-- Auto-organized by Biome
-
-## Important Files Reference
-
-### Backend Entry Points
-
-| File | Purpose |
-|------|---------|
-| `cmd/memos/main.go` | Server entry point, CLI setup |
-| `server/server.go` | Echo server initialization, background runners |
-| `store/store.go` | Store wrapper with caching |
-| `store/driver.go` | Database driver interface |
-
-### API Layer
-
-| File | Purpose |
-|------|---------|
-| `server/router/api/v1/v1.go` | Service registration, gateway setup |
-| `server/router/api/v1/acl_config.go` | Public endpoints whitelist |
-| `server/router/api/v1/connect_interceptors.go` | Connect interceptors |
-| `server/auth/authenticator.go` | Authentication logic |
-
-### Frontend Core
-
-| File | Purpose |
-|------|---------|
-| `web/src/lib/query-client.ts` | React Query client configuration |
-| `web/src/contexts/AuthContext.tsx` | User authentication state |
-| `web/src/contexts/ViewContext.tsx` | UI preferences |
-| `web/src/contexts/MemoFilterContext.tsx` | Filter state |
-| `web/src/hooks/useMemoQueries.ts` | Memo queries/mutations |
-
-### Data Layer
-
-| File | Purpose |
-|------|---------|
-| `store/memo.go` | Memo model definitions, store methods |
-| `store/user.go` | User model definitions |
-| `store/attachment.go` | Attachment model definitions |
-| `store/migrator.go` | Migration logic |
-| `store/db/db.go` | Driver factory |
-| `store/db/sqlite/sqlite.go` | SQLite driver implementation |
-
-## Configuration
-
-### Backend Environment Variables
-
-| Variable | Default | Description |
-|----------|----------|-------------|
-| `MEMOS_DEMO` | `false` | Enable demo mode |
-| `MEMOS_PORT` | `8081` | HTTP port |
-| `MEMOS_ADDR` | `` | Bind address (empty = all) |
-| `MEMOS_DATA` | `~/.memos` | Data directory |
-| `MEMOS_DRIVER` | `sqlite` | Database: `sqlite`, `mysql`, `postgres` |
-| `MEMOS_DSN` | `` | Database connection string |
-| `MEMOS_INSTANCE_URL` | `` | Instance base URL |
-
-### Frontend Environment Variables
-
-| Variable | Default | Description |
-|----------|----------|-------------|
-| `DEV_PROXY_SERVER` | `http://localhost:8081` | Backend proxy target |
-
-## CI/CD
-
-### GitHub Workflows
-
-**Backend Tests** (`.github/workflows/backend-tests.yml`):
-- Runs on `go.mod`, `go.sum`, `**.go` changes
-- Steps: verify `go mod tidy`, golangci-lint, all tests
-
-**Frontend Tests** (`.github/workflows/frontend-tests.yml`):
-- Runs on `web/**` changes
-- Steps: pnpm install, lint, build
-
-**Proto Lint** (`.github/workflows/proto-linter.yml`):
-- Runs on `.proto` changes
-- Steps: buf lint, buf breaking check
-
-### Linting Configuration
-
-**Go** (`.golangci.yaml`):
-- Linters: revive, govet, staticcheck, misspell, gocritic, etc.
-- Formatter: goimports
-- Forbidden: `fmt.Errorf`, `ioutil.ReadDir`
-
-**TypeScript** (`web/biome.json`):
-- Linting: Biome (ESLint replacement)
-- Formatting: Biome (Prettier replacement)
-- Line width: 140 characters
-- Semicolons: always
-
-## Common Tasks
-
-### Debugging API Issues
-
-1. Check Connect interceptor logs: `server/router/api/v1/connect_interceptors.go:79-105`
-2. Verify endpoint is in `acl_config.go` if public
-3. Check authentication via `auth/authenticator.go:133-165`
-4. Test with curl: `curl -H "Authorization: Bearer <token>" http://localhost:8081/api/v1/...`
-
-### Debugging Frontend State
-
-1. Open React Query DevTools (bottom-left in dev)
-2. Inspect query cache, mutations, refetch behavior
-3. Check Context state via React DevTools
-4. Verify filter state in MemoFilterContext
-
-### Running Tests Against Multiple Databases
-
-```bash
-# SQLite (default)
-DRIVER=sqlite go test ./...
-
-# MySQL (requires running MySQL server)
-DRIVER=mysql DSN="user:pass@tcp(localhost:3306)/memos" go test ./...
-
-# PostgreSQL (requires running PostgreSQL server)
-DRIVER=postgres DSN="postgres://user:pass@localhost:5432/memos" go test ./...
-```
-
-## Plugin System
-
-Backend supports pluggable components in `plugin/`:
-
-| Plugin | Purpose |
-|--------|----------|
-| `scheduler` | Cron-based job scheduling |
-| `email` | SMTP email delivery |
-| `filter` | CEL expression filtering |
-| `webhook` | HTTP webhook dispatch |
-| `markdown` | Markdown parsing (goldmark) |
-| `httpgetter` | HTTP content fetching |
-| `storage/s3` | S3-compatible storage |
-
-Each plugin has its own README with usage examples.
-
-## Performance Considerations
-
-### Backend
-
-- Database queries use pagination (`limit`, `offset`)
-- In-memory caching reduces DB hits for frequently accessed data
-- WAL journal mode for SQLite (reduces locking)
-- Thumbnail generation limited to 3 concurrent operations
-
-### Frontend
-
-- React Query reduces redundant API calls
-- Infinite queries for large lists (pagination)
-- Manual chunks: `utils-vendor`, `mermaid-vendor`, `leaflet-vendor`
-- Lazy loading for heavy components
-
-## Security Notes
-
-- JWT secrets must be kept secret (generated on first run in production mode)
-- Personal Access Tokens stored as SHA-256 hashes in database
-- CSRF protection via SameSite cookies
-- CORS enabled for all origins (configure for production)
-- Input validation at service layer
-- SQL injection prevention via parameterized queries
+## Repository Layout
+
+Every root folder is named for what it holds. Read the folder's `doc.go` or `README.md` before adding to it.
+
+| Path | Holds | May import |
+| --- | --- | --- |
+| `cmd/memos/` | Cobra/Viper CLI setup and server startup | anything |
+| `server/` | The HTTP process: net/http bootstrap, graceful shutdown, every transport | core, store, provider, markdown, filter, internal |
+| `server/api/` | Connect/gRPC-Gateway services, ACL config, SSE hub. Thin handlers; rules go to `core/` | |
+| `server/fileserver/` | Native HTTP file serving, thumbnails, range requests | |
+| `server/frontend/` | Static SPA serving; `dist/` is the built SPA baked in by `go:embed` | |
+| `server/mcp/` | Model Context Protocol server | |
+| `server/auth/` | JWT access tokens, refresh tokens, PAT handling | |
+| `core/` | Business rules with no HTTP and no SQL: `access`, `notification`, `memopayload`, `memoexport`, `usagelimit`, `identityprovider`, `instancesetting`, `user`, `configuration` | store, provider, markdown, filter, internal |
+| `store/` | Store facade, cache, migrations, `Driver` interface; `store/db/{sqlite,mysql,postgres}/` implement it | provider, markdown, filter, internal |
+| `markdown/` | Markdown engine: parser, AST, memos syntax extensions, renderer, memo payload | proto/gen, internal |
+| `filter/` | CEL filter compiler: parse to IR, render to SQL per driver, filterable field schema | internal |
+| `provider/` | Backends configured by instance settings: `ai`, `idp`, `storage` | proto/gen, internal |
+| `internal/` | Private plumbing with no memos vocabulary (`identifier`, `email`, `webhook`, `ratelimit`, …) | third party only |
+| `proto/api/`, `proto/store/` | Public API and internal storage proto sources; `proto/gen/` is generated | |
+| `web/src/` | React SPA: `connect.ts` clients, `auth-state.ts`, `hooks/`, `contexts/`, `components/`, `lib/`, `locales/`, `themes/` | |
+
+Layering rules, enforced by `depguard` in `.golangci.yaml`:
+
+- Imports point downward only: `cmd` → `server` → `core` → `store` → {`provider`, `markdown`, `filter`} → `internal`.
+- `internal/` packages import nothing from this module (except `internal/testutil`, which may import `proto/gen`).
+- A package goes in `internal/` only if it could be published as a standalone module unchanged. If it knows what a Memo, Space, or instance setting is, it is a root package.
+- Never create `util`, `common`, `base`, `helpers`, `misc`, or `pkg` packages. Name a package for the one thing it does, or put the code next to its only caller.
+- New business rules extracted from `server/api` go to `core/<resource>/`, one package per resource.
+
+File convention inside `server/api/`: `<resource>_service.go` holds the RPC handlers, `<resource>_service_converters.go` the
+store↔proto conversion, and `<resource>_service_<topic>.go` further splits. Extend the matching file; do not add `*_helpers2.go`.
+Identity providers and instance settings are the exception: declarative configuration files use their API messages, so their
+conversion lives in `core/identityprovider` and `core/instancesetting`, and `server/api` keeps only response redaction.
+Black-box service tests live in `server/api/test/`, unit tests next to the code.
+
+## Change Routing
+
+| Change | Update | Verify |
+| --- | --- | --- |
+| Go service or router behavior | Handlers under `server/`, rules under `core/`, tests near package | `go test -v -race ./server/... ./core/...` |
+| Store or migration behavior | `store/`, all three DB driver migrations, `LATEST.sql` | `go test -v ./store/...` |
+| Markdown, filter, or provider logic | `markdown/`, `filter/`, `provider/` | `go test -v -race ./markdown/... ./filter/... ./provider/...` |
+| Internal package logic | Relevant `internal/` package tests | `go test -v -race ./internal/...` |
+| Frontend behavior | Components/hooks/contexts under `web/src/` | `cd web && pnpm lint && pnpm test` |
+| Frontend production output | Vite config or release-sensitive UI | `cd web && pnpm build` or `pnpm release` |
+| Proto API | `.proto` source, generated outputs, `proto/api/CHANGELOG.md` for breaks | `cd proto && buf generate && buf lint` |
+| Public unauthenticated route | `server/api/acl_config.go` | Targeted server test or manual route check |
+
+## Go Conventions
+
+- Wrap errors with `errors.Wrap(err, "context")` from `github.com/pkg/errors`; do not use `fmt.Errorf`.
+- Return service errors with `status.Errorf(codes.X, "message")`.
+- Keep imports grouped as stdlib, third-party, then `github.com/usememos/memos`; goimports is run by golangci-lint.
+- Add doc comments for exported identifiers; godot enforces exported comment punctuation.
+- Avoid package-level mutable state unless the surrounding package already uses that pattern.
+
+## Frontend Conventions
+
+- Use `@/` for absolute imports.
+- Follow Biome formatting: 2-space indent, double quotes, semicolons, 140-character line width.
+- Put server data in React Query hooks under `web/src/hooks/`; keep UI-only state in contexts or component state.
+- Show, edit and compose memos through `web/src/components/MemoEditor` (a name or draft seed plus a mode); see its `README.md`.
+- Keep generated proto TypeScript under `web/src/types/proto/` out of manual edits and Biome rewrites.
+- UI work reads `web/node_modules/@usememos/ui/llms.txt` first: `@usememos/ui` is the design system (tokens, type classes,
+  components). Controls come from the package; build a part it lacks on Base UI as its `custom-components.md` describes.
+- Use a package component when one fits (`Button`, `Link`, `Spinner`, `Badge`). Its class functions (`buttonClasses()`,
+  `menuClasses()`, `badgeClasses()`) are for elements it can't render, such as a router link or a Base UI trigger.
+- Menus have fixed density; do not pass `size` to `Menu.Root` or `menuClasses()`, or use `mu-compact` to size menu rows.
+  Compact three-dot trigger buttons keep `sm`.
+- Field text follows its component size on every device; do not add touch-specific font sizing.
+- Style with Tailwind CSS v4 and the package's `mu-` utilities (`bg-mu-surface`, `text-mu-text-secondary`, `rounded-mu-md`),
+  text with its type classes (`mu-caption`, `mu-body`, `mu-label`, `mu-title`), and `cn()` for class merging. No Tailwind
+  text sizes or old color names (`muted-foreground`, `destructive`, `popover`). The exceptions are the brand wordmark and
+  emoji glyphs, whose font size is their icon box (`SpaceIcon`, `SpaceMark`, `MemoViewIcon`, `CustomIconPicker`, `ReactionSelector`).
+- Custom controls using `mu-focus` must reserve a real 1px border (transparent for borderless controls).
+- Focus shows through `mu-focus`. Never add `ring-*` or `focus-visible:ring-*`, and never pair `mu-focus` with
+  `outline-none`, which overrides it. Visually hidden text uses `mu-visually-hidden`; a control that appears on focus keeps
+  Tailwind's `sr-only focus-visible:not-sr-only` pair.
+- Report failures with `showErrorToast` from `web/src/lib/toast.ts`. A form's own validation errors go under the field
+  (`Field.Error`, kept in `useFieldErrors`), not in a toast.
+- Every new key in `web/src/locales/en.json` is translated into all locales; `tests/locale-resources.test.ts` fails
+  otherwise. A plural message is stored as `key_one`, `key_other`, … and looked up by its base key with `count`.
+- Lucide icons outside a package control take a size class that sets box and stroke together: `mu-icon-xs` (12px),
+  `mu-icon-sm` (14px) or `mu-icon` (16px). No Tailwind sizes on 12–16px icons and no `strokeWidth`.
+
+## Database And Proto Rules
+
+- Prefer MySQL SQL and metadata checks shared with MariaDB when correctness, performance, and maintainability are preserved.
+  Keep MariaDB on the MySQL driver and dialect; verify shared SQL changes against both database targets.
+- Schema changes require SQLite, MySQL, and PostgreSQL migrations plus `LATEST.sql` updates.
+- Fresh-install SQL and incremental migrations must stay equivalent.
+- Proto field changes must preserve compatibility unless the task explicitly allows a breaking API change. Record every
+  allowed break in `proto/api/CHANGELOG.md`; compatibility is checked during review.
+- Regenerate after proto edits and include both Go/OpenAPI and TypeScript generated outputs.
+
+## Verification Policy
+
+- Run the narrowest relevant checks while iterating.
+- Before finishing, run the checks that match the changed surface from "Change Routing".
+- For docs-only changes, `git diff --check` is sufficient unless the docs include runnable examples that should be tested.
+- If a required check cannot run locally, report the reason and the exact command that remains.
+
+## CI Reference
+
+- Releases are cut by pushing a `YY.MM.N[-rc.K]` tag. To cut, promote, or check a release, follow
+  `.agents/skills/release/SKILL.md`.
+- Development builds use the HEAD committer date in UTC as `YY.MM.D-dev.<sha7>`; release builds inject the CalVer tag.
+- `go build` embeds Git metadata automatically; `go run` needs `-buildvcs=true`. Builds without Git metadata must inject
+  `github.com/usememos/memos/internal/version.Version` through `-ldflags`.
+- Docker excludes `.git`; pass `--build-arg VERSION="$(bash scripts/release_version.sh development-version)"` and
+  `--build-arg COMMIT="$(git rev-parse HEAD)"` when building locally (build frontend assets first).
+
+- Workflows install toolchains through `.github/actions/setup-go` (Go version from `go.mod`) and `.github/actions/setup-web`
+  (pnpm from `web/package.json`, Node 24, `pnpm install`); change versions there, not per workflow.
+- Backend CI: Go 1.27.4, `go mod tidy`, `go fix -diff ./...`, golangci-lint v2.14.0 (including goimports), test groups
+  `store`, `server`, `internal`, `other` (`cmd`, `core`, `markdown`, `filter`, `provider`, `proto`).
+- Frontend CI: Node 24, pnpm 11.0.1, `pnpm lint`, `pnpm test`, `pnpm build`.
+- Proto CI: `buf lint` and `buf format` check.
+- Docker: `scripts/Dockerfile`, Alpine 3.21 runtime, non-root user, port 5230, multi-arch amd64/arm64/arm/v7.

@@ -1,159 +1,237 @@
-import { ArchiveIcon, CheckIcon, GlobeIcon, LogOutIcon, PaletteIcon, SettingsIcon, SquareUserIcon, User2Icon } from "lucide-react";
+import { badgeClasses, Menu, menuClasses } from "@usememos/ui";
+import {
+  ArchiveIcon,
+  BellIcon,
+  ChevronRightIcon,
+  GlobeIcon,
+  InfoIcon,
+  LogOutIcon,
+  type LucideIcon,
+  PaletteIcon,
+  SettingsIcon,
+} from "lucide-react";
+import { type ReactNode, useState } from "react";
+import { Link, matchPath, useLocation } from "react-router-dom";
+import { ScopePanelRowIcon } from "@/components/AppSidebar/SidebarRow";
+import { SCOPE_PANEL_ICON_CLASSES, SCOPE_PANEL_ROW_CLASSES, SIDEBAR_LEADING_SLOT_CLASSES } from "@/components/AppSidebar/sidebar-layout";
+import UserAvatar from "@/components/UserAvatar";
+import { useAppSidebar } from "@/contexts/AppSidebarContext";
 import { useAuth } from "@/contexts/AuthContext";
 import useCurrentUser from "@/hooks/useCurrentUser";
-import useNavigateTo from "@/hooks/useNavigateTo";
-import { useUpdateUserGeneralSetting } from "@/hooks/useUserQueries";
+import { useSSEConnectionStatus } from "@/hooks/useLiveMemoRefresh";
+import { useNotifications, useUpdateUserGeneralSetting } from "@/hooks/useUserQueries";
 import { locales } from "@/i18n";
 import { cn } from "@/lib/utils";
 import { Routes } from "@/router";
+import { UserNotification_Status } from "@/types/proto/api/user_service_pb";
+import { buildAuthRoute } from "@/utils/auth-redirect";
 import { getLocaleDisplayName, getLocaleWithFallback, loadLocale, useTranslate } from "@/utils/i18n";
 import { getThemeWithFallback, loadTheme, THEME_OPTIONS } from "@/utils/theme";
-import UserAvatar from "./UserAvatar";
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuSub,
-  DropdownMenuSubContent,
-  DropdownMenuSubTrigger,
-  DropdownMenuTrigger,
-} from "./ui/dropdown-menu";
 
-interface Props {
-  collapsed?: boolean;
+interface PreferenceSubmenuProps {
+  icon: LucideIcon;
+  label: string;
+  value: string;
+  options: Array<{ value: string; label: string }>;
+  onChange: (value: string) => void;
+  /** Long lists scroll; typing jumps to a match. */
+  className?: string;
 }
 
-const UserMenu = (props: Props) => {
-  const { collapsed } = props;
+/** A row that opens its choices beside the panel, like a submenu, and applies one on select. */
+const PreferenceSubmenu = ({ icon: Icon, label, value, options, onChange, className }: PreferenceSubmenuProps) => (
+  <Menu.Root modal={false}>
+    <Menu.Trigger openOnHover className={SCOPE_PANEL_ROW_CLASSES}>
+      <ScopePanelRowIcon icon={Icon} />
+      <span className="shrink-0">{label}</span>
+      <span className="min-w-0 flex-1 truncate text-end text-mu-text-secondary">
+        {options.find((option) => option.value === value)?.label ?? value}
+      </span>
+      <ChevronRightIcon aria-hidden="true" className={cn(SCOPE_PANEL_ICON_CLASSES, "rtl:rotate-180")} />
+    </Menu.Trigger>
+    {/* Like a nested submenu: its first row lines up with this one, and its rows match the panel's fixed menu density.
+        When neither side has room (narrow screens), it drops below the row instead of overflowing. */}
+    <Menu.Popup
+      side="inline-end"
+      align="start"
+      collisionAvoidance={{ fallbackAxisSide: "end" }}
+      positionMethod="fixed"
+      className={className}
+    >
+      <Menu.RadioGroup value={value} onValueChange={onChange}>
+        {options.map((option) => (
+          <Menu.RadioItem key={option.value} value={option.value} closeOnClick>
+            {option.label}
+          </Menu.RadioItem>
+        ))}
+      </Menu.RadioGroup>
+    </Menu.Popup>
+  </Menu.Root>
+);
+
+const LOCALE_OPTIONS = locales.map((locale) => ({ value: locale, label: getLocaleDisplayName(locale) }));
+
+/** Theme and language apply at once: saved to the account when signed in, otherwise kept in this browser. */
+const UserPreferenceMenu = () => {
   const t = useTranslate();
-  const navigateTo = useNavigateTo();
   const currentUser = useCurrentUser();
-  const { userGeneralSetting, refetchSettings, logout } = useAuth();
+  const { userGeneralSetting, refetchSettings } = useAuth();
   const { mutate: updateUserGeneralSetting } = useUpdateUserGeneralSetting(currentUser?.name);
-  const currentLocale = getLocaleWithFallback(userGeneralSetting?.locale);
-  const currentTheme = getThemeWithFallback(userGeneralSetting?.theme);
+  // The chosen value shows immediately, before a signed-in save round-trips.
+  const [theme, setTheme] = useState<string>();
+  const [locale, setLocale] = useState<string>();
+  const currentTheme = theme ?? getThemeWithFallback(userGeneralSetting?.theme);
+  const currentLocale = locale ?? getLocaleWithFallback(userGeneralSetting?.locale);
 
-  const handleLocaleChange = async (locale: Locale) => {
-    if (!currentUser) return;
-    // Apply locale immediately for instant UI feedback and persist to localStorage
-    loadLocale(locale);
-    // Persist to user settings
-    updateUserGeneralSetting(
-      { generalSetting: { locale }, updateMask: ["locale"] },
-      {
-        onSuccess: () => {
-          refetchSettings();
-        },
-      },
-    );
-  };
-
-  const handleThemeChange = async (theme: string) => {
-    if (!currentUser) return;
-    // Apply theme immediately for instant UI feedback
-    loadTheme(theme);
-    // Persist to user settings
-    updateUserGeneralSetting(
-      { generalSetting: { theme }, updateMask: ["theme"] },
-      {
-        onSuccess: () => {
-          refetchSettings();
-        },
-      },
-    );
-  };
-
-  const handleSignOut = async () => {
-    // First, clear auth state and cache BEFORE doing anything else
-    await logout();
-
-    try {
-      // Then clear user-specific localStorage items
-      // Preserve app-wide settings (theme, locale, view preferences, tag view settings)
-      const keysToPreserve = ["memos-theme", "memos-locale", "memos-view-setting", "tag-view-as-tree", "tag-tree-auto-expand"];
-      const keysToRemove: string[] = [];
-
-      for (let i = 0; i < localStorage.length; i++) {
-        const key = localStorage.key(i);
-        if (key && !keysToPreserve.includes(key)) {
-          keysToRemove.push(key);
-        }
-      }
-
-      keysToRemove.forEach((key) => localStorage.removeItem(key));
-    } catch {
-      // Ignore errors from localStorage operations
+  const handleThemeChange = (value: string) => {
+    setTheme(value);
+    loadTheme(value);
+    if (currentUser) {
+      updateUserGeneralSetting({ generalSetting: { theme: value }, updateMask: ["theme"] }, { onSuccess: () => refetchSettings() });
     }
+  };
 
-    // Always redirect to auth page (use replace to prevent back navigation)
-    window.location.replace(Routes.AUTH);
+  const handleLocaleChange = (value: string) => {
+    setLocale(loadLocale(value));
+    if (currentUser) {
+      updateUserGeneralSetting({ generalSetting: { locale: value }, updateMask: ["locale"] }, { onSuccess: () => refetchSettings() });
+    }
   };
 
   return (
-    <DropdownMenu>
-      <DropdownMenuTrigger asChild disabled={!currentUser}>
-        <div className={cn("w-auto flex flex-row justify-start items-center cursor-pointer text-foreground", collapsed ? "px-1" : "px-3")}>
-          {currentUser?.avatarUrl ? (
-            <UserAvatar className="shrink-0" avatarUrl={currentUser?.avatarUrl} />
-          ) : (
-            <User2Icon className="w-6 mx-auto h-auto text-muted-foreground" />
-          )}
-          {!collapsed && (
-            <span className="ml-2 text-lg font-medium text-foreground grow truncate">
-              {currentUser?.displayName || currentUser?.username}
-            </span>
-          )}
-        </div>
-      </DropdownMenuTrigger>
-      <DropdownMenuContent align="start">
-        <DropdownMenuItem onClick={() => navigateTo(`/u/${encodeURIComponent(currentUser?.username ?? "")}`)}>
-          <SquareUserIcon className="size-4 text-muted-foreground" />
-          {t("common.profile")}
-        </DropdownMenuItem>
-        <DropdownMenuItem onClick={() => navigateTo(Routes.ARCHIVED)}>
-          <ArchiveIcon className="size-4 text-muted-foreground" />
-          {t("common.archived")}
-        </DropdownMenuItem>
-        <DropdownMenuSub>
-          <DropdownMenuSubTrigger>
-            <GlobeIcon className="size-4 text-muted-foreground" />
-            {t("common.language")}
-          </DropdownMenuSubTrigger>
-          <DropdownMenuSubContent className="max-h-[90vh] overflow-y-auto">
-            {locales.map((locale) => (
-              <DropdownMenuItem key={locale} onClick={() => handleLocaleChange(locale)}>
-                {currentLocale === locale && <CheckIcon className="w-4 h-auto" />}
-                {currentLocale !== locale && <span className="w-4" />}
-                {getLocaleDisplayName(locale)}
-              </DropdownMenuItem>
-            ))}
-          </DropdownMenuSubContent>
-        </DropdownMenuSub>
-        <DropdownMenuSub>
-          <DropdownMenuSubTrigger>
-            <PaletteIcon className="size-4 text-muted-foreground" />
-            {t("setting.preference-section.theme")}
-          </DropdownMenuSubTrigger>
-          <DropdownMenuSubContent>
-            {THEME_OPTIONS.map((option) => (
-              <DropdownMenuItem key={option.value} onClick={() => handleThemeChange(option.value)}>
-                {currentTheme === option.value && <CheckIcon className="w-4 h-auto" />}
-                {currentTheme !== option.value && <span className="w-4" />}
-                {option.label}
-              </DropdownMenuItem>
-            ))}
-          </DropdownMenuSubContent>
-        </DropdownMenuSub>
-        <DropdownMenuItem onClick={() => navigateTo(Routes.SETTING)}>
-          <SettingsIcon className="size-4 text-muted-foreground" />
-          {t("common.settings")}
-        </DropdownMenuItem>
-        <DropdownMenuItem onClick={handleSignOut}>
-          <LogOutIcon className="size-4 text-muted-foreground" />
-          {t("common.sign-out")}
-        </DropdownMenuItem>
-      </DropdownMenuContent>
-    </DropdownMenu>
+    <section aria-label={t("setting.preference.label")}>
+      <PreferenceSubmenu
+        icon={PaletteIcon}
+        label={t("setting.preference.theme")}
+        value={currentTheme}
+        options={THEME_OPTIONS.map((option) => ({ value: option.value, label: t(option.labelKey) }))}
+        onChange={handleThemeChange}
+      />
+      <PreferenceSubmenu
+        icon={GlobeIcon}
+        label={t("common.language")}
+        value={currentLocale}
+        options={LOCALE_OPTIONS}
+        onChange={handleLocaleChange}
+        className="max-h-72"
+      />
+    </section>
+  );
+};
+
+/** A page in the panel: a link on the menu row look, marked when it is the current page. */
+const NavRow = ({
+  to,
+  icon,
+  current,
+  onNavigate,
+  children,
+}: {
+  to: string;
+  icon: LucideIcon;
+  current?: boolean;
+  onNavigate: () => void;
+  children: ReactNode;
+}) => (
+  <Link to={to} viewTransition aria-current={current ? "page" : undefined} className={SCOPE_PANEL_ROW_CLASSES} onClick={onNavigate}>
+    <ScopePanelRowIcon icon={icon} />
+    <span className="min-w-0 flex-1 truncate">{children}</span>
+  </Link>
+);
+
+/** The account half of the scope menu: preferences for everyone, then the user's own pages. */
+const UserMenu = ({ onClose }: { onClose: () => void }) => {
+  const t = useTranslate();
+  const location = useLocation();
+  const { setMobileOpen } = useAppSidebar();
+  const currentUser = useCurrentUser();
+  const sseStatus = useSSEConnectionStatus();
+  const { logout } = useAuth();
+  const { data: notifications = [] } = useNotifications();
+  const unreadCount = notifications.filter((notification) => notification.status === UserNotification_Status.UNREAD).length;
+  const inboxLabel = unreadCount > 0 ? `${t("common.inbox")}, ${unreadCount} ${t("inbox.unread")}` : t("common.inbox");
+  const accountLabel = currentUser?.displayName || currentUser?.username || t("common.profile");
+  const inboxActive = Boolean(matchPath(Routes.INBOX, location.pathname));
+  const archivedActive = Boolean(matchPath(Routes.ARCHIVED, location.pathname));
+
+  const closePanel = () => {
+    onClose();
+    setMobileOpen(false);
+  };
+
+  const handleSignOut = async () => {
+    await logout();
+    try {
+      const keysToPreserve = ["memos-theme", "memos-locale", "memos-view-setting", "tag-view-as-tree"];
+      const keysToRemove: string[] = [];
+      for (let i = 0; i < localStorage.length; i++) {
+        const key = localStorage.key(i);
+        if (key && !keysToPreserve.includes(key)) keysToRemove.push(key);
+      }
+      keysToRemove.forEach((key) => localStorage.removeItem(key));
+    } catch {
+      // Ignore errors from localStorage operations.
+    }
+    window.location.replace(buildAuthRoute({ autoSignIn: false }));
+  };
+
+  return (
+    <>
+      <UserPreferenceMenu />
+      <div role="separator" className={menuClasses().separator} />
+      <section aria-label={t("setting.sso.account")}>
+        {currentUser && (
+          <>
+            <div className="flex h-(--mu-row-height) items-center gap-2 px-(--mu-row-padding)">
+              <span className={cn(SIDEBAR_LEADING_SLOT_CLASSES, "relative")}>
+                <UserAvatar avatarUrl={currentUser.avatarUrl} name={accountLabel} className="size-5" />
+                {sseStatus !== "connected" && (
+                  <span
+                    role="img"
+                    aria-label={t(`live-update.${sseStatus}` as Parameters<typeof t>[0])}
+                    className={cn(
+                      "absolute -bottom-0.5 -end-0.5 size-2.5 rounded-full border-2 border-mu-surface",
+                      sseStatus === "connecting" ? "animate-pulse bg-mu-text-secondary" : "bg-mu-danger-key",
+                    )}
+                  />
+                )}
+              </span>
+              <span className="min-w-0 flex-1 truncate mu-label">{accountLabel}</span>
+              {/* A quiet chip beside the name: the package's badge look on a link. */}
+              <Link
+                to={Routes.INBOX}
+                viewTransition
+                aria-label={inboxLabel}
+                aria-current={inboxActive ? "page" : undefined}
+                className={cn(badgeClasses({ tone: "neutral" }), "border border-transparent mu-focus focus-visible:border-mu-focus")}
+                onClick={closePanel}
+              >
+                <BellIcon aria-hidden="true" className="mu-icon-xs" />
+                {t("common.inbox")}
+                {unreadCount > 0 && <span className="tabular-nums text-mu-primary">{unreadCount > 99 ? "99+" : unreadCount}</span>}
+              </Link>
+            </div>
+            <NavRow to={Routes.ARCHIVED} current={archivedActive} icon={ArchiveIcon} onNavigate={closePanel}>
+              {t("common.archived")}
+            </NavRow>
+            <NavRow to={Routes.SETTING} icon={SettingsIcon} onNavigate={closePanel}>
+              {t("common.settings")}
+            </NavRow>
+          </>
+        )}
+        <NavRow to={Routes.ABOUT} icon={InfoIcon} onNavigate={closePanel}>
+          {t("common.about")}
+        </NavRow>
+        {/* Guests sign in from the sidebar footer, which is always in view. */}
+        {currentUser && (
+          // Leaving is secondary to the pages above it, so it reads quieter.
+          <button type="button" className={cn(SCOPE_PANEL_ROW_CLASSES, "text-mu-text-secondary")} onClick={() => void handleSignOut()}>
+            <ScopePanelRowIcon icon={LogOutIcon} />
+            <span className="min-w-0 flex-1 truncate">{t("common.sign-out")}</span>
+          </button>
+        )}
+      </section>
+    </>
   );
 };
 

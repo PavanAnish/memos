@@ -29,14 +29,6 @@ func formatInt(n int) string {
 }
 
 // =============================================================================
-// Pointer Helpers
-// =============================================================================
-
-func boolPtr(b bool) *bool {
-	return &b
-}
-
-// =============================================================================
 // Test Fixture Builders
 // =============================================================================
 
@@ -63,6 +55,11 @@ func (b *MemoBuilder) Content(content string) *MemoBuilder {
 
 func (b *MemoBuilder) Visibility(v store.Visibility) *MemoBuilder {
 	b.memo.Visibility = v
+	return b
+}
+
+func (b *MemoBuilder) CreatedTs(ts int64) *MemoBuilder {
+	b.memo.CreatedTs = ts
 	return b
 }
 
@@ -168,7 +165,7 @@ func (tc *MemoFilterTestContext) CreateMemo(b *MemoBuilder) *store.Memo {
 func (tc *MemoFilterTestContext) PinMemo(memoID int32) {
 	err := tc.Store.UpdateMemo(tc.Ctx, &store.UpdateMemo{
 		ID:     memoID,
-		Pinned: boolPtr(true),
+		Pinned: new(true),
 	})
 	require.NoError(tc.T, err)
 }

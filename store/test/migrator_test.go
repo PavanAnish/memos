@@ -2,15 +2,37 @@ package test
 
 import (
 	"context"
-	"fmt"
-	"os"
+	"database/sql"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/require"
 
+	storepb "github.com/usememos/memos/proto/gen/store"
 	"github.com/usememos/memos/store"
+	storedb "github.com/usememos/memos/store/db"
 )
+
+type delayedInstanceSettingCreateDriver struct {
+	store.Driver
+	entered chan<- struct{}
+	release <-chan struct{}
+}
+
+func (d *delayedInstanceSettingCreateDriver) CreateInstanceSettingIfNotExists(ctx context.Context, create *store.InstanceSetting) (bool, error) {
+	d.entered <- struct{}{}
+	<-d.release
+	return d.Driver.CreateInstanceSettingIfNotExists(ctx, create)
+}
+
+func requireQueryError(ctx context.Context, t *testing.T, db *sql.DB, query, message string) {
+	t.Helper()
+	rows, err := db.QueryContext(ctx, query)
+	if rows != nil {
+		defer rows.Close()
+		require.NoError(t, rows.Err())
+	}
+	require.Error(t, err, message)
+}
 
 // TestFreshInstall verifies that LATEST.sql applies correctly on a fresh database.
 // This is essentially what NewTestingStore already does, but we make it explicit.
@@ -25,12 +47,103 @@ func TestFreshInstall(t *testing.T) {
 	// Verify migration completed successfully
 	currentSchemaVersion, err := ts.GetCurrentSchemaVersion()
 	require.NoError(t, err)
-	require.NotEmpty(t, currentSchemaVersion, "schema version should be set after fresh install")
+	require.Equal(t, "26.11.1", currentSchemaVersion, "fresh install should record the latest migration")
 
 	// Verify we can read instance settings (basic sanity check)
 	instanceSetting, err := ts.GetInstanceBasicSetting(ctx)
 	require.NoError(t, err)
 	require.Equal(t, currentSchemaVersion, instanceSetting.SchemaVersion)
+
+	// The fresh schema supports memo-local Space placement without adding a
+	// canonical thread shape. COMMENT remains an ordinary relation row.
+	driver := getDriverFromEnv()
+	insertSpace := "INSERT INTO space (id, uid, title, description, payload) VALUES (?, ?, ?, ?, '{}')"
+	insertMemo := "INSERT INTO memo (id, uid, creator_id, content, visibility, payload, space_id) VALUES (?, ?, ?, ?, ?, ?, ?)"
+	insertRelation := "INSERT INTO memo_relation (memo_id, related_memo_id, type) VALUES (?, ?, ?)"
+	if driver == "postgres" {
+		insertSpace = "INSERT INTO space (id, uid, title, description, payload) VALUES ($1, $2, $3, $4, '{}')"
+		insertMemo = "INSERT INTO memo (id, uid, creator_id, content, visibility, payload, space_id) VALUES ($1, $2, $3, $4, $5, $6, $7)"
+		insertRelation = "INSERT INTO memo_relation (memo_id, related_memo_id, type) VALUES ($1, $2, $3)"
+	}
+	_, err = ts.GetDriver().GetDB().ExecContext(ctx, insertSpace, 900001, "fresh-space", "Fresh Space", "schema fixture")
+	require.NoError(t, err)
+	_, err = ts.GetDriver().GetDB().ExecContext(ctx, insertMemo, 900001, "fresh-context", 1, "context", store.Public, `{}`, nil)
+	require.NoError(t, err)
+	_, err = ts.GetDriver().GetDB().ExecContext(ctx, insertMemo, 900002, "fresh-comment", 1, "comment", store.SpaceAudience, `{}`, 900001)
+	require.NoError(t, err)
+	_, err = ts.GetDriver().GetDB().ExecContext(ctx, insertRelation, 900002, 900001, store.MemoRelationComment)
+	require.NoError(t, err)
+
+	var relationCount int
+	require.NoError(t, ts.GetDriver().GetDB().QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM memo_relation WHERE memo_id = 900002 AND related_memo_id = 900001 AND type = 'COMMENT'",
+	).Scan(&relationCount))
+	require.Equal(t, 1, relationCount)
+
+	requireQueryError(ctx, t, ts.GetDriver().GetDB(), "SELECT parent_memo_id, root_memo_id FROM memo LIMIT 0", "fresh memo schema must not contain canonical-root columns")
+	requireQueryError(ctx, t, ts.GetDriver().GetDB(), "SELECT row_status FROM space LIMIT 0", "fresh Space schema has no archived state")
+	requireLookupIndexes(ctx, t, ts, driver)
+}
+
+// requireLookupIndexes checks the indexes that usage limit checks rely on to
+// count a user's memos and sum a user's attachment sizes, and the index that
+// memo lists and the has_attachments and has_image filters use to find a
+// memo's attachments without scanning the attachment table.
+func requireLookupIndexes(ctx context.Context, t *testing.T, ts *store.Store, driver string) {
+	t.Helper()
+	for _, indexName := range []string{"idx_memo_creator_id", "idx_attachment_creator_id"} {
+		var query string
+		switch driver {
+		case "sqlite":
+			query = "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?"
+		case "mysql":
+			query = "SELECT COUNT(DISTINCT INDEX_NAME) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND INDEX_NAME = ?"
+		case "postgres":
+			query = "SELECT COUNT(*) FROM pg_indexes WHERE schemaname = current_schema() AND indexname = $1"
+		default:
+			t.Fatalf("unsupported driver: %s", driver)
+		}
+		var count int
+		require.NoError(t, ts.GetDriver().GetDB().QueryRowContext(ctx, query, indexName).Scan(&count))
+		require.Equal(t, 1, count, "index %s must exist", indexName)
+	}
+
+	columns := []string{"memo_id", "type"}
+	index := attachmentLookupIndex(driver)
+	var query string
+	switch driver {
+	case "sqlite":
+		query = `SELECT info.name FROM pragma_index_list('attachment') AS list
+			JOIN pragma_index_info(list.name) AS info
+			WHERE list.name = ? AND list."unique" = 0 AND list.partial = 0 ORDER BY info.seqno`
+	case "mysql":
+		query = `SELECT COLUMN_NAME FROM information_schema.STATISTICS
+			WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'attachment' AND INDEX_NAME = ?
+			AND NON_UNIQUE = 1 AND SUB_PART IS NULL AND INDEX_TYPE = 'BTREE'
+			ORDER BY SEQ_IN_INDEX`
+	case "postgres":
+		columns = []string{"memo_id"}
+		query = `SELECT pg_get_indexdef(i.indexrelid, k, true)
+			FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+			JOIN pg_am am ON am.oid = c.relam
+			CROSS JOIN LATERAL generate_series(1, i.indnatts) AS k
+			WHERE i.indexrelid = to_regclass($1) AND i.indrelid = 'attachment'::regclass
+			AND i.indisvalid AND i.indisready AND NOT i.indisunique
+			AND i.indpred IS NULL AND i.indexprs IS NULL AND am.amname = 'btree' ORDER BY k`
+	default:
+		t.Fatalf("unsupported driver: %s", driver)
+	}
+	rows, err := ts.GetDriver().GetDB().QueryContext(ctx, query, index)
+	require.NoError(t, err)
+	defer rows.Close()
+	var actual []string
+	for rows.Next() {
+		var column string
+		require.NoError(t, rows.Scan(&column))
+		actual = append(actual, column)
+	}
+	require.NoError(t, rows.Err())
+	require.Equal(t, columns, actual, "index %s must have the expected ordered attachment columns", index)
 }
 
 // TestMigrationReRun verifies that re-running the migration on an already
@@ -100,7 +213,7 @@ func TestMigrationMultipleReRuns(t *testing.T) {
 	require.NoError(t, err)
 
 	// Run migration multiple times
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		err = ts.Migrate(ctx)
 		require.NoError(t, err, "migration run %d should not fail", i+1)
 	}
@@ -111,90 +224,87 @@ func TestMigrationMultipleReRuns(t *testing.T) {
 	require.Equal(t, initialVersion, finalVersion, "version should remain unchanged after multiple re-runs")
 }
 
-// TestMigrationFromStableVersion verifies that upgrading from a stable Memos version
-// to the current version works correctly. This is the critical upgrade path test.
-//
-// Test flow:
-// 1. Start a stable Memos container to create a database with the old schema
-// 2. Stop the container and wait for cleanup
-// 3. Use the store directly to run migration with current code
-// 4. Verify the migration succeeded and data can be written
-//
-// Note: This test is skipped when running with -race flag because testcontainers
-// has known race conditions in its reaper code that are outside our control.
-func TestMigrationFromStableVersion(t *testing.T) {
-	// Skip for non-SQLite drivers (simplifies the test)
-	if getDriverFromEnv() != "sqlite" {
-		t.Skip("skipping upgrade test for non-sqlite driver")
-	}
-
-	// Skip if explicitly disabled (e.g., in environments without Docker)
-	if os.Getenv("SKIP_CONTAINER_TESTS") == "1" {
-		t.Skip("skipping container-based test (SKIP_CONTAINER_TESTS=1)")
-	}
-
+func TestConcurrentInstanceAccessInitializationKeepsFirstInsert(t *testing.T) {
 	ctx := context.Background()
-	dataDir := t.TempDir()
+	driverName := getDriverFromEnv()
+	baseProfile := getTestingProfileForDriver(t, driverName)
 
-	// 1. Start stable Memos container to create database with old schema
-	cfg := MemosContainerConfig{
-		Driver:  "sqlite",
-		DataDir: dataDir,
-		Version: StableMemosVersion,
+	baseDriver, err := storedb.NewDBDriver(baseProfile)
+	require.NoError(t, err)
+	baseStore := store.New(baseDriver, baseProfile)
+	require.NoError(t, baseStore.Migrate(ctx))
+	require.NoError(t, baseStore.DeleteInstanceSetting(ctx, &store.DeleteInstanceSetting{
+		Name: storepb.InstanceSettingKey_ACCESS.String(),
+	}))
+	require.NoError(t, baseStore.Close())
+
+	publicProfile := *baseProfile
+	publicProfile.InstanceURL = "https://public.example.com"
+	publicDriver, err := storedb.NewDBDriver(&publicProfile)
+	require.NoError(t, err)
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+	delayedPublicDriver := &delayedInstanceSettingCreateDriver{
+		Driver:  publicDriver,
+		entered: entered,
+		release: release,
 	}
+	publicStore := store.New(delayedPublicDriver, &publicProfile)
+	defer publicStore.Close()
 
-	t.Logf("Starting Memos %s container to create old-schema database...", cfg.Version)
-	container, err := StartMemosContainer(ctx, cfg)
-	require.NoError(t, err, "failed to start stable memos container")
-
-	// Wait for the container to fully initialize the database
-	time.Sleep(10 * time.Second)
-
-	// Stop the container gracefully
-	t.Log("Stopping stable Memos container...")
-	err = container.Terminate(ctx)
-	require.NoError(t, err, "failed to stop memos container")
-
-	// Wait for file handles to be released
-	time.Sleep(2 * time.Second)
-
-	// 2. Connect to the database directly and run migration with current code
-	dsn := fmt.Sprintf("%s/memos_prod.db", dataDir)
-	t.Logf("Connecting to database at %s...", dsn)
-
-	ts := NewTestingStoreWithDSN(ctx, t, "sqlite", dsn)
-
-	// Get the schema version before migration
-	oldSetting, err := ts.GetInstanceBasicSetting(ctx)
+	privateProfile := *baseProfile
+	privateProfile.InstanceURL = ""
+	privateDriver, err := storedb.NewDBDriver(&privateProfile)
 	require.NoError(t, err)
-	t.Logf("Old schema version: %s", oldSetting.SchemaVersion)
+	privateStore := store.New(privateDriver, &privateProfile)
+	defer privateStore.Close()
 
-	// 3. Run migration with current code
-	t.Log("Running migration with current code...")
-	err = ts.Migrate(ctx)
-	require.NoError(t, err, "migration from stable version should succeed")
+	publicMigration := make(chan error, 1)
+	go func() {
+		publicMigration <- publicStore.Migrate(ctx)
+	}()
+	<-entered
+	released := false
+	defer func() {
+		if !released {
+			close(release)
+		}
+	}()
 
-	// 4. Verify migration succeeded
-	newVersion, err := ts.GetCurrentSchemaVersion()
-	require.NoError(t, err)
-	t.Logf("New schema version: %s", newVersion)
+	// The private instance reaches the database first. The delayed public
+	// initializer must lose the unique-key race without overwriting it.
+	require.NoError(t, privateStore.Migrate(ctx))
+	close(release)
+	released = true
+	require.NoError(t, <-publicMigration)
 
-	newSetting, err := ts.GetInstanceBasicSetting(ctx)
-	require.NoError(t, err)
-	require.Equal(t, newVersion, newSetting.SchemaVersion, "schema version should be updated")
-
-	// Verify we can write data to the migrated database
-	user, err := createTestingHostUser(ctx, ts)
-	require.NoError(t, err, "should create user after migration")
-
-	memo, err := ts.CreateMemo(ctx, &store.Memo{
-		UID:        "post-upgrade-memo",
-		CreatorID:  user.ID,
-		Content:    "Content after upgrade from stable",
-		Visibility: store.Public,
+	setting, err := privateStore.GetUncachedInstanceSetting(ctx, &store.FindInstanceSetting{
+		Name: storepb.InstanceSettingKey_ACCESS.String(),
 	})
-	require.NoError(t, err, "should create memo after migration")
-	require.Equal(t, "Content after upgrade from stable", memo.Content)
+	require.NoError(t, err)
+	require.NotNil(t, setting)
+	require.Equal(t, storepb.InstanceAccessMode_INSTANCE_ACCESS_MODE_PRIVATE, setting.GetAccessSetting().AccessMode)
 
-	t.Logf("Migration successful: %s -> %s", oldSetting.SchemaVersion, newVersion)
+	// Re-running either initializer is also a no-op once ACCESS is persisted.
+	require.NoError(t, publicStore.Migrate(ctx))
+	setting, err = publicStore.GetUncachedInstanceSetting(ctx, &store.FindInstanceSetting{
+		Name: storepb.InstanceSettingKey_ACCESS.String(),
+	})
+	require.NoError(t, err)
+	require.Equal(t, storepb.InstanceAccessMode_INSTANCE_ACCESS_MODE_PRIVATE, setting.GetAccessSetting().AccessMode)
+}
+
+func TestCheckSchemaCurrent(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	ts := NewTestingStore(ctx, t)
+	t.Cleanup(func() { require.NoError(t, ts.Close()) })
+	require.NoError(t, ts.CheckSchemaCurrent(ctx), "a migrated database is current")
+
+	basic, err := ts.GetInstanceBasicSetting(ctx)
+	require.NoError(t, err)
+	basic.SchemaVersion = "0.31.8"
+	_, err = ts.UpsertInstanceSetting(ctx, &storepb.InstanceSetting{Key: storepb.InstanceSettingKey_BASIC, Value: &storepb.InstanceSetting_BasicSetting{BasicSetting: basic}})
+	require.NoError(t, err)
+	require.ErrorContains(t, ts.CheckSchemaCurrent(ctx), "start this version of Memos once to migrate it")
 }

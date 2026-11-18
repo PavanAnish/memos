@@ -1,23 +1,16 @@
 import { useCallback } from "react";
-import { useInstance } from "@/contexts/InstanceContext";
-import useNavigateTo from "@/hooks/useNavigateTo";
+import { useDevicePreferences } from "@/hooks/useDevicePreferences";
+import type { PreviewMediaItem } from "@/utils/media-item";
 
 interface UseMemoHandlersOptions {
-  memoName: string;
-  parentPage: string;
   readonly: boolean;
   openEditor: () => void;
-  openPreview: (url: string) => void;
+  openPreview: (items: string | string[] | PreviewMediaItem[], index?: number) => void;
 }
 
 export const useMemoHandlers = (options: UseMemoHandlersOptions) => {
-  const { memoName, parentPage, readonly, openEditor, openPreview } = options;
-  const navigateTo = useNavigateTo();
-  const { memoRelatedSetting } = useInstance();
-
-  const handleGotoMemoDetailPage = useCallback(() => {
-    navigateTo(`/${memoName}`, { state: { from: parentPage } });
-  }, [memoName, parentPage, navigateTo]);
+  const { readonly, openEditor, openPreview } = options;
+  const { doubleClickEdit } = useDevicePreferences();
 
   const handleMemoContentClick = useCallback(
     (e: React.MouseEvent) => {
@@ -35,13 +28,13 @@ export const useMemoHandlers = (options: UseMemoHandlersOptions) => {
   const handleMemoContentDoubleClick = useCallback(
     (e: React.MouseEvent) => {
       if (readonly) return;
-      if (memoRelatedSetting.enableDoubleClickEdit) {
+      if (doubleClickEdit) {
         e.preventDefault();
         openEditor();
       }
     },
-    [readonly, openEditor, memoRelatedSetting.enableDoubleClickEdit],
+    [readonly, openEditor, doubleClickEdit],
   );
 
-  return { handleGotoMemoDetailPage, handleMemoContentClick, handleMemoContentDoubleClick };
+  return { handleMemoContentClick, handleMemoContentDoubleClick };
 };
